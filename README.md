@@ -853,15 +853,7 @@ Logs:
 
 # 📜 License
 
-Choose and add an appropriate open-source license before publishing the repository.
-
-For example:
-
-```text
-MIT License
-```
-
-or another license appropriate for the project's source and any third-party components.
+This project is licensed under the [MIT License](LICENSE)..
 
 ---
 

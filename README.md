@@ -1,5 +1,25 @@
 # Motorola UDFPS Bridge — Boston
 
+# Motorola UDFPS Bridge — Boston
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Target-Motorola%20Boston-8865FF?style=for-the-badge&logo=motorola&logoColor=white" alt="Target: Motorola Boston">
+  <img src="https://img.shields.io/badge/Android-GSI-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android GSI">
+  <img src="https://img.shields.io/badge/Architecture-ARM64-0078D4?style=for-the-badge" alt="ARM64">
+  <img src="https://img.shields.io/badge/Fingerprint-Optical%20UDFPS-FF6B35?style=for-the-badge" alt="Optical UDFPS">
+  <img src="https://img.shields.io/badge/Language-C%2B%2B-00599C?style=for-the-badge&logo=cplusplus&logoColor=white" alt="C++">
+  <img src="https://img.shields.io/badge/Status-Experimental-orange?style=for-the-badge" alt="Experimental">
+  <img src="https://img.shields.io/badge/License-MIT-2EA44F?style=for-the-badge" alt="MIT License">
+</p>
+
+<p align="center">
+  <b>Native Local-HBM FOD bridge for Motorola Boston</b>
+</p>
+
+<p align="center">
+  Restoring hardware-level optical fingerprint illumination and capture on GSI/custom ROM environments.
+</p>
+
 A native C++ **Local-HBM (High Brightness Mode) FOD/UDFPS bridge** for the **Motorola Moto G Stylus 5G (2024), codename Boston**.
 
 This project was developed to restore working optical in-display fingerprint illumination and fingerprint capture on a GSI/custom ROM environment while continuing to use Motorola's existing vendor fingerprint implementation.

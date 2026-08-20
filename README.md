@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/C%2B%2B17-purple?style=for-the-badge" alt="C++17">
 </p>
 
-> A small native C++ bridge that restores optical **under-display fingerprint (UDFPS/FOD)** functionality on supported Motorola devices running a **GSI or AOSP-based custom ROM**, by using the existing vendor fingerprint stack and the panel's native Local-HBM mechanism.
+> A small native C++ bridge that restores optical **under-display fingerprint (UDFPS/FOD)** functionality on supported Motorola devices running a **GSI ROM**, by using the existing vendor fingerprint stack and the panel's native Local-HBM mechanism.
 
 ---
 
@@ -248,7 +248,7 @@ is sent and the display returns to normal mode.
 Before trying this project, you should have:
 
 - A Motorola device with an **optical UDFPS/FOD sensor**.
-- A working GSI or AOSP-based custom ROM.
+- A working GSI ROM.
 - The device's stock/compatible vendor partition.
 - Root access.
 - Magisk or KernelSU.

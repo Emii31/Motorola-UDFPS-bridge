@@ -99,7 +99,7 @@ The GSI could display the fingerprint UI, but it did not know how to trigger Mot
 
 ## The Advice I Got
 
-The obvious solution suggested by other developers was to:
+The obvious solution suggested (because no Custom rom for Boston) by other developers was to:
 
 - Port a donor fingerprint HAL.
 - Port/decompile/recompile HIDL components.

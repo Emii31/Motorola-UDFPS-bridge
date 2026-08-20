@@ -1,0 +1,6 @@
+id=moto_fod_bridge
+name=Motorola Native Local-HBM FOD Bridge
+version=1.0
+versionCode=1
+author=Elite Assistant & Imam(Emii31)
+description=Permanent hardware Local-HBM Mode 4 bridge for optical fingerprint scanner.

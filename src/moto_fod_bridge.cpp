@@ -23,19 +23,19 @@ struct disp_param_req {
 
 static int g_drm_fd = -1;
 static atomic_bool g_session_active = ATOMIC_VAR_INIT(false);
+static atomic_bool g_is_enrolling = ATOMIC_VAR_INIT(false);
 static atomic_bool g_running = ATOMIC_VAR_INIT(true);
+static atomic_uint_fast64_t g_last_touch_ms = ATOMIC_VAR_INIT(0);
 static const char* FOD_EN_NODE = "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
 
 static void set_panel_mode(int mode) {
     if (g_drm_fd < 0) return;
     struct disp_param_req req;
     if (mode == 4) {
-        // Mode 4: Native Local-HBM (Circle Spot only) -> param0=2, param1=2, param2=0
         req.param_id = 0; req.value = 2; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
         req.param_id = 1; req.value = 2; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
         req.param_id = 2; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
     } else {
-        // Mode 0: NORMAL (param0=0, param1=0, param2=0)
         req.param_id = 0; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
         req.param_id = 1; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
         req.param_id = 2; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
@@ -55,7 +55,7 @@ static void handle_exit(int sig) {
     set_panel_mode(0);
     write_int_to_file(FOD_EN_NODE, 0);
     if (g_drm_fd >= 0) close(g_drm_fd);
-    printf("\n[*] Safety exit (signal %d). Restored display to normal mode.\n", sig);
+    printf("\n[*] Restored display to normal mode.\n");
     _exit(0);
 }
 
@@ -119,28 +119,80 @@ static uint64_t get_time_ms() {
     return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
 }
 
+static void disarm_sensor() {
+    if (atomic_load(&g_session_active)) {
+        atomic_store(&g_session_active, false);
+        atomic_store(&g_is_enrolling, false);
+        set_panel_mode(0);
+        write_int_to_file(FOD_EN_NODE, 0);
+        printf("\n[<<<] BIOMETRIC PROMPT CLOSED -> Sensor Disarmed\n");
+    }
+}
+
+static void arm_sensor(bool enrolling) {
+    atomic_store(&g_is_enrolling, enrolling);
+    atomic_store(&g_last_touch_ms, get_time_ms());
+    if (!atomic_load(&g_session_active)) {
+        atomic_store(&g_session_active, true);
+        write_int_to_file(FOD_EN_NODE, 1);
+        printf("\n[>>>] BIOMETRIC PROMPT ACTIVE -> Sensor Armed (Enroll: %d)\n", enrolling);
+    }
+}
+
 static void* session_listener_thread(void* arg) {
-    FILE* pipe = popen("logcat -v time -s BiometricService:D UdfpsController:D", "r");
+    FILE* pipe = popen("logcat -v time -b all -s BiometricService:D UdfpsController:D FingerprintService:D AuthService:D KeyguardUpdateMonitor:D KeyguardViewMediator:D wm_task_to_front:I wm_activity_launch_time:I ActivityTaskManager:I", "r");
     if (!pipe) return nullptr;
 
     char line[512];
     while (atomic_load(&g_running) && fgets(line, sizeof(line), pipe)) {
-        if (strstr(line, "showUdfpsOverlay") || strstr(line, "authenticate") || strstr(line, "enroll")) {
-            if (!atomic_load(&g_session_active)) {
-                atomic_store(&g_session_active, true);
-                write_int_to_file(FOD_EN_NODE, 1);
-                printf("\n[>>>] BIOMETRIC PROMPT ACTIVE -> Sensor Armed\n");
-            }
-        } else if (strstr(line, "hideUdfpsOverlay") || strstr(line, "onAuthSessionEnded") || strstr(line, "resetLockout")) {
-            if (atomic_load(&g_session_active)) {
-                atomic_store(&g_session_active, false);
-                set_panel_mode(0);
-                write_int_to_file(FOD_EN_NODE, 0);
-                printf("\n[<<<] BIOMETRIC PROMPT CLOSED -> Sensor Disarmed\n");
+        // Enrollment start
+        if (strstr(line, "startEnroll") || strstr(line, "enroll(") || strstr(line, "FingerprintEnrollEnrolling")) {
+            arm_sensor(true);
+        }
+        // General auth start
+        else if (strstr(line, "showUdfpsOverlay") || strstr(line, "authenticate")) {
+            arm_sensor(false);
+        } 
+        // Disarming triggers
+        else if (strstr(line, "hideUdfpsOverlay") || 
+                 strstr(line, "onAuthSessionEnded") || 
+                 strstr(line, "onAuthenticated(true)") ||
+                 strstr(line, "keyguardGoingAway") ||
+                 strstr(line, "setKeyguardOccluded(false)") ||
+                 strstr(line, "dismissKeyguard") ||
+                 strstr(line, "startExitAnimation") ||
+                 strstr(line, "FingerprintEnrollFinish") ||
+                 strstr(line, "FingerprintSettings") ||
+                 strstr(line, "onEnrollmentProgress(remaining=0)") ||
+                 strstr(line, "cancelAuthentication") ||
+                 strstr(line, "cancelEnrollment") ||
+                 strstr(line, "resetLockout") ||
+                 strstr(line, "client null") ||
+                 strstr(line, "stopEnroll") ||
+                 strstr(line, "Launcher")) {
+            if (atomic_load(&g_session_active) && !strstr(line, "FingerprintEnrollEnrolling")) {
+                disarm_sensor();
             }
         }
     }
     pclose(pipe);
+    return nullptr;
+}
+
+// Enrollment Inactivity Guard Thread (Auto-disarms if idle for 2.5 seconds on the Done screen)
+static void* enroll_watchdog_thread(void* arg) {
+    while (atomic_load(&g_running)) {
+        usleep(250000); // 250ms interval
+        if (atomic_load(&g_session_active) && atomic_load(&g_is_enrolling)) {
+            uint64_t now = get_time_ms();
+            uint64_t last = atomic_load(&g_last_touch_ms);
+            // If enrollment completed and no touch on sensor for > 2.5 seconds -> disarm
+            if (now > last && (now - last > 2500)) {
+                printf("\n[⏱️] Enrollment completed / idle timeout reached -> Auto Disarming\n");
+                disarm_sensor();
+            }
+        }
+    }
     return nullptr;
 }
 
@@ -156,7 +208,7 @@ int main() {
     set_panel_mode(0);
     write_int_to_file(FOD_EN_NODE, 0);
 
-    printf("[*] Starting Native LHBM FOD Bridge (Mode 4)...\n");
+    printf("[*] Starting Native LHBM FOD Bridge (v4 - Auto-Disarm Watchdog)...\n");
 
     void* hidl_lib = dlopen("/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so", RTLD_NOW);
     if (!hidl_lib) {
@@ -188,8 +240,9 @@ int main() {
         return 1;
     }
 
-    pthread_t listener_tid;
+    pthread_t listener_tid, watchdog_tid;
     pthread_create(&listener_tid, nullptr, session_listener_thread, nullptr);
+    pthread_create(&watchdog_tid, nullptr, enroll_watchdog_thread, nullptr);
 
     printf("[+] Ready for touch events.\n");
 
@@ -213,14 +266,13 @@ int main() {
             if (ev.type == EV_KEY && (ev.code == 704 || ev.code == 0x2c0)) {
                 if (ev.value == 1) { // Touch DOWN
                     last_touch_ms = now;
+                    atomic_store(&g_last_touch_ms, now);
+
                     if (!is_touch_active) {
                         is_touch_active = true;
                         touch_count++;
 
-                        // 1. Activate Hardware Local-HBM Circle
                         set_panel_mode(4);
-
-                        // 2. Trigger TrustZone frame capture
                         printf("[+] [%d] Local-HBM ON -> sendFodEvent(0)\n", touch_count);
                         call_bphw_send_fod_event(send_fod_sym, motoFpInstance, 0, &vec, &cb);
                     }
@@ -228,13 +280,10 @@ int main() {
             }
         }
 
-        // Keep spot on for optical integration (~160ms), then reset
+        // Release timeout for optical frame integration (~160ms)
         if (is_touch_active && (now - last_touch_ms > 160)) {
             is_touch_active = false;
-
-            // Reset panel to normal
             set_panel_mode(0);
-
             printf("[-] [%d] Normal Restore -> sendFodEvent(1)\n", touch_count);
             call_bphw_send_fod_event(send_fod_sym, motoFpInstance, 1, &vec, &cb);
         }

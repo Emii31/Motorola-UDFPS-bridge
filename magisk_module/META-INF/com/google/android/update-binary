@@ -1,0 +1,34 @@
+#!/sbin/sh
+#################
+# Magisk Module #
+#################
+umask 022
+
+# Load Magisk functions
+OUTFD=$2
+ZIPFILE=$3
+
+BOOTMODE=true
+ps | grep zygote | grep -v grep >/dev/null 2>&1 || BOOTMODE=false
+$BOOTMODE || ps -A 2>/dev/null | grep zygote | grep -v grep >/dev/null 2>&1 || BOOTMODE=false
+
+if ! $BOOTMODE; then
+    ui_print "[-] This module must be flashed via Magisk Manager in Android OS!"
+    exit 1
+fi
+
+MODPATH="/data/adb/modules/moto_native_lhbm_fod"
+mkdir -p "$MODPATH"
+rm -rf "$MODPATH"/*
+
+unzip -o "$ZIPFILE" -d "$MODPATH" >/dev/null 2>&1
+
+chmod 755 "$MODPATH/service.sh"
+chmod 755 "$MODPATH/vendor/bin/moto_fod_bridge"
+chcon u:object_r:vendor_file:s0 "$MODPATH/vendor/bin/moto_fod_bridge" 2>/dev/null || true
+
+ui_print "****************************************"
+ui_print " Motorola Native Local-HBM FOD Bridge  "
+ui_print " Successfully Installed!               "
+ui_print "****************************************"
+exit 0

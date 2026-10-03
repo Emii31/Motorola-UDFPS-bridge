@@ -54,10 +54,11 @@ if [ ! -f "src/moto_fod_bridge.cpp" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 1. Detect Input Event & Keycodes
+# ------------------------------------------------------------------------------
+# 1. Detect Input Event & Keycode Automatically
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 1/6] Detecting Fingerprint Input Event Node...${NC}"
+echo -e "${BLUE}[Step 1/6] Detecting Fingerprint Input Event Node & Keycode...${NC}"
 echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor area on your screen now...${NC}"
 echo -e "${YELLOW}   (Waiting 7 seconds for touch events)${NC}"
 
@@ -68,28 +69,30 @@ GE_PID=$!
 sleep 7
 kill $GE_PID 2>/dev/null || true
 
-# Parse log for input node
-DETECTED_EVENT=$(grep -E "BTN_TOUCH|BTN_TRIGGER_HAPPY|02c0|704" "$GE_LOG" | head -n 1 | awk '{print $1}' | tr -d ':')
+# Parse log for input event node
+DETECTED_EVENT=$(grep -E "BTN_TOUCH|BTN_TRIGGER_HAPPY|02c0|0140|704" "$GE_LOG" | head -n 1 | awk '{print $1}' | tr -d ':')
 
 if [ -z "$DETECTED_EVENT" ]; then
     echo -e "${RED}[!] Could not automatically detect input node during touch.${NC}"
-    read -p "Enter your input event node manually (e.g., /dev/input/event8): " DETECTED_EVENT
+    read -p "Enter your input event node manually (e.g., /dev/input/event10): " DETECTED_EVENT
 else
     echo -e "${GREEN}[✓] Detected Input Node: $DETECTED_EVENT${NC}"
 fi
 
-# Ask keycode preference
-echo -e "Which keycode did your touch trigger?"
-echo "1) BTN_TRIGGER_HAPPY (704 / 0x2c0) [Default]"
-echo "2) BTN_TOUCH (330 / 0x140)"
-echo "3) Custom Keycode"
-read -p "Select option [1-3]: " KEY_CHOICE
+# Automatically determine Keycode from the recorded touch log
+echo -e "${BLUE}[*] Analyzing captured keycodes from touch log...${NC}"
 
-case $KEY_CHOICE in
-    2) CHOSEN_KEY="330" ;;
-    3) read -p "Enter custom keycode (decimal): " CHOSEN_KEY ;;
-    *) CHOSEN_KEY="704" ;;
-esac
+if grep -q -E "02c0|BTN_TRIGGER_HAPPY" "$GE_LOG"; then
+    CHOSEN_KEY="704"
+    echo -e "${GREEN}[✓] Automatically detected Keycode: 704 (BTN_TRIGGER_HAPPY)${NC}"
+elif grep -q -E "0140|BTN_TOUCH" "$GE_LOG"; then
+    CHOSEN_KEY="330"
+    echo -e "${GREEN}[✓] Automatically detected Keycode: 330 (BTN_TOUCH)${NC}"
+else
+    CHOSEN_KEY="704"
+    echo -e "${YELLOW}[!] Specific keycode not matched in log. Defaulting to 704 (BTN_TRIGGER_HAPPY)${NC}"
+fi
+
 
 # ------------------------------------------------------------------------------
 # 2. Detect FOD Sysfs Node

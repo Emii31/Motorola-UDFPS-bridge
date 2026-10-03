@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
 # ==============================================================================
-# Automated Motorola UDFPS FOD Bridge Porting Tool for Termux
+# Automated Motorola / GSI Local-HBM UDFPS Bridge Porting Tool for Termux
 # ==============================================================================
 
 set -e
@@ -15,7 +15,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 echo -e "${CYAN}======================================================"${NC}
-echo -e "${CYAN}   Motorola Native Local-HBM UDFPS Bridge Auto-Porter "${NC}
+echo -e "${CYAN}   Motorola/GSI Local-HBM UDFPS Bridge Auto-Porter   "${NC}
 echo -e "${CYAN}======================================================"${NC}
 echo ""
 
@@ -23,7 +23,7 @@ echo ""
 # 0. Check Root & Environment Setup
 # ------------------------------------------------------------------------------
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${YELLOW}[!] This script requires root access to inspect devices.${NC}"
+    echo -e "${YELLOW}[!] This script requires root access to inspect devices and HALs.${NC}"
     echo -e "${YELLOW}[*] Relaunching with su...${NC}"
     exec su -c "bash $0 $@"
 fi
@@ -48,7 +48,7 @@ fi
 # 1. Detect Input Event & Keycodes
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 1/6] Detecting Fingerprint Input Event Node & Keycode...${NC}"
+echo -e "${BLUE}[Step 1/6] Detecting Fingerprint Input Event Node...${NC}"
 echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor area on your screen now...${NC}"
 echo -e "${YELLOW}   (Waiting 7 seconds for touch events)${NC}"
 
@@ -105,25 +105,45 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Detect Motorola Biometric Vendor Library
+# 3. Detect Biometric Service & Library (With GSI Fallback Support)
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 3/6] Detecting Vendor Biometric Shared Library...${NC}"
+echo -e "${BLUE}[Step 3/6] Detecting Active Biometric Service & Library...${NC}"
 
-DEFAULT_LIB="/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"
+# Check running processes to see if GSI or Stock daemon is active
+RUNNING_SERVICE=$(ps -A | grep -E "fingerprint|biometric" | awk '{print $NF}' | head -n 1 || true)
 
-if [ -f "$DEFAULT_LIB" ]; then
-    DETECTED_LIB="$DEFAULT_LIB"
-    echo -e "${GREEN}[✓] Found Motorola Fingerprint HAL: $DETECTED_LIB${NC}"
-else
+if [ -n "$RUNNING_SERVICE" ]; then
+    echo -e "${GREEN}[✓] Active Fingerprint Process: $RUNNING_SERVICE${NC}"
+fi
+
+# Priority library candidates: GSI native vendor HALs first, then Motorola extensions
+POSSIBLE_LIBS=(
+    "/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service-jv.so"
+    "/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service.so"
+    "/vendor/lib64/hw/fingerprint.default.so"
+    "/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"
+)
+
+DETECTED_LIB=""
+for lib in "${POSSIBLE_LIBS[@]}"; do
+    if [ -f "$lib" ]; then
+        DETECTED_LIB="$lib"
+        echo -e "${GREEN}[✓] Target HAL Library Matched: $DETECTED_LIB${NC}"
+        break
+    fi
+done
+
+if [ -z "$DETECTED_LIB" ]; then
+    echo -e "${YELLOW}[!] Target HAL library not found in default paths. Searching /vendor/lib64...${NC}"
     FOUND_LIBS=$(find /vendor/lib64/ -name "*fingerprint*" 2>/dev/null || true)
     if [ -n "$FOUND_LIBS" ]; then
         DETECTED_LIB=$(echo "$FOUND_LIBS" | head -n 1)
-        echo -e "${YELLOW}[!] Found alternative fingerprint library: $DETECTED_LIB${NC}"
+        echo -e "${YELLOW}[!] Selected fallback library: $DETECTED_LIB${NC}"
     else
-        echo -e "${RED}[!] Vendor fingerprint library not found!${NC}"
-        read -p "Enter vendor fingerprint library path [$DEFAULT_LIB]: " USER_LIB
-        DETECTED_LIB=${USER_LIB:-$DEFAULT_LIB}
+        DEFAULT_FALLBACK="/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service-jv.so"
+        read -p "Enter vendor fingerprint library path [$DEFAULT_FALLBACK]: " USER_LIB
+        DETECTED_LIB=${USER_LIB:-$DEFAULT_FALLBACK}
     fi
 fi
 
@@ -133,7 +153,7 @@ fi
 echo ""
 echo -e "${BLUE}[Step 4/6] Calibrating DRM Local-HBM (LHBM) Display Parameters...${NC}"
 
-# Compile test_lhbm on the fly
+# Compile temporary test executable
 cat << 'EOF' > /tmp/test_lhbm.c
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,7 +204,6 @@ if [ ! -c "$DRM_DEV" ]; then
     DRM_DEV=${USER_DRM:-"/dev/dri/card0"}
 fi
 
-# Presets to test
 PARAM_PRESETS=(
     "2 2 0"  # Boston / G85 default
     "1 1 0"  # Alternative OLED
@@ -241,8 +260,12 @@ cp src/moto_fod_bridge.cpp src/moto_fod_bridge.cpp.bak
 # Update values in C++ source using sed
 sed -i "s|/dev/input/event[0-9]*|$DETECTED_EVENT|g" src/moto_fod_bridge.cpp
 sed -i "s|/sys/devices/platform/goodix_ts[^\"]*|$DETECTED_SYSFS|g" src/moto_fod_bridge.cpp
-sed -i "s|/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so|$DETECTED_LIB|g" src/moto_fod_bridge.cpp
+sed -i "s|/vendor/lib64/[^\"]*\.so|$DETECTED_LIB|g" src/moto_fod_bridge.cpp
 sed -i "s|/dev/dri/card[0-9]*|$DRM_DEV|g" src/moto_fod_bridge.cpp
+
+# Patch LHBM parameters inside C++ array if present
+sed -i "s|req.value = [0-9]*; // p0|req.value = $WORKING_P0; // p0|g" src/moto_fod_bridge.cpp
+sed -i "s|req.value = [0-9]*; // p1|req.value = $WORKING_P1; // p1|g" src/moto_fod_bridge.cpp
 
 echo -e "${GREEN}[✓] src/moto_fod_bridge.cpp successfully updated!${NC}"
 
@@ -255,7 +278,7 @@ echo -e "${BLUE}[Step 6/6] Compiling Binary and Building Magisk Module...${NC}"
 mkdir -p magisk_module/vendor/bin
 mkdir -p out
 
-# Compile
+# Compile binary
 clang++ -std=c++17 -O3 \
     src/moto_fod_bridge.cpp \
     -o magisk_module/vendor/bin/moto_fod_bridge \
@@ -268,9 +291,16 @@ else
     exit 1
 fi
 
-# Zip module
-chmod +x zip_module.sh 2>/dev/null || true
-./zip_module.sh
+# Package module ZIP
+if [ -f "zip_module.sh" ]; then
+    chmod +x zip_module.sh
+    ./zip_module.sh
+else
+    echo -e "${YELLOW}[*] Zipping module...${NC}"
+    cd magisk_module
+    zip -r ../out/moto_fod_bridge_module.zip ./*
+    cd ..
+fi
 
 echo ""
 echo -e "${GREEN}======================================================"${NC}

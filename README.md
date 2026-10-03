@@ -19,13 +19,13 @@
 - [3. The Solution](#3-the-solution)
 - [4. How the Bridge Works](#4-how-the-bridge-works)
 - [5. Prerequisites](#5-prerequisites)
-- [6. Before You Start](#6-before-you-start)
-- [7. Porting to Your Device](#7-porting-to-your-device)
-  - [7.1 Find the FOD Input Event](#71-find-the-fod-input-event)
+- [6. Automated One-Command Setup & Porting (Recommended)](#6-automated-one-command-setup--porting-recommended)
+- [7. Manual Porting to Your Device](#7-manual-porting-to-your-device)
+  - [7.1 Find the FOD Input Event & Keycode](#71-find-the-fod-input-event--keycode)
   - [7.2 Find the FOD Sysfs Node](#72-find-the-fod-sysfs-node)
-  - [7.3 Find the Motorola Fingerprint Library](#73-find-the-motorola-fingerprint-library)
+  - [7.3 Find the Fingerprint Library & GSI Service Fallbacks](#73-find-the-fingerprint-library--gsi-service-fallbacks)
   - [7.4 Find the Display DRM Node](#74-find-the-display-drm-node)
-  - [7.5 Find the Local-HBM Parameters](#75-find-the-local-hbm-parameters)
+  - [7.5 Calibrate Local-HBM Parameters](#75-calibrate-local-hbm-parameters)
   - [7.6 Update the C++ Source](#76-update-the-c-source)
 - [8. Build the Project](#8-build-the-project)
 - [9. Build the Magisk Module](#9-build-the-magisk-module)
@@ -44,23 +44,17 @@
 
 This project started with a very simple problem after running a **GSI on a Motorola device with an optical fingerprint sensor**.
 
-The GSI detected the fingerprint sensor incorrectly and treated it like a fingerprint sensor mounted on the back of the phone.
-
-So the fingerprint icon appeared in the wrong place.
+The GSI detected the fingerprint sensor incorrectly and treated it like a fingerprint sensor mounted on the back of the phone, showing the icon in the wrong location.
 
 ### The first problem
 
-The first thing I fixed was the UDFPS position using a framework/SystemUI overlay.
-
-After applying the overlay:
+The first thing I fixed was the UDFPS position using a framework/SystemUI overlay:
 
 - The fingerprint icon appeared in the correct position.
 - Android understood that the fingerprint sensor was under the display.
 - The UI looked correct.
 
-But the fingerprint still did **not** work.
-
-That led to the second problem.
+But the fingerprint still did **not** work. That led to the second problem.
 
 ---
 
@@ -75,13 +69,11 @@ There was:
 - ❌ Fingerprint enrollment failed.
 - ❌ Fingerprint unlocking failed.
 
-The problem was not simply the position of the fingerprint icon.
+An optical fingerprint sensor needs the display to illuminate the area above the sensor so it can read the reflected light from your finger.
 
-An optical fingerprint sensor needs the display to illuminate the area above the sensor so the sensor can read the reflected light from the finger.
+On stock Motorola firmware, several components work together:
 
-On the stock Motorola firmware, several components work together:
 
-```text
 Motorola Display
        ↓
 Local-HBM
@@ -91,39 +83,10 @@ Fingerprint Sensor
 Motorola Fingerprint HAL
        ↓
 TrustZone / TEE
-```
 
-The GSI could display the fingerprint UI, but it did not know how to trigger Motorola's proprietary hardware behavior.
-
----
-
-## The Advice I Got
-
-The obvious solution suggested (because no Custom rom for Boston) by other developers was to:
-
-- Port a donor fingerprint HAL.
-- Port/decompile/recompile HIDL components.
-- Replace or modify complicated vendor fingerprint components.
-
-That was a much bigger job than I wanted to do.
-
-So instead of replacing the existing vendor fingerprint implementation, I looked at what was **already working in the stock vendor**.
-
-The important discovery was:
-
-> The Motorola fingerprint vendor components were already there.
-
-The missing piece was the bridge between the GSI fingerprint session, the FOD touch event, the display's Local-HBM control and Motorola's fingerprint interface.
-
-That is what this project provides.
-
----
-
-# 3. The Solution
-
-Instead of replacing the fingerprint HAL, the bridge connects the existing pieces:
-
-```text
+The GSI could display the fingerprint UI, but it did not know how to trigger Motorola's proprietary hardware behavior or talk to the active vendor fingerprint daemon.
+3. The Solution
+Instead of replacing or porting a massive donor HAL, this bridge acts as a lightweight C++ middleware between GSI biometric sessions, display DRM controls, input events, and vendor fingerprint libraries:
                 GSI / AOSP
                     │
                     ▼
@@ -140,373 +103,83 @@ Instead of replacing the fingerprint HAL, the bridge connects the existing piece
              │               │
              └───────┬───────┘
                      ▼
-          Motorola Fingerprint HIDL
+  Motorola / GSI Biometric Fingerprint HAL
                      │
                      ▼
                 TrustZone / TEE
                      │
                      ▼
              Optical Fingerprint
-```
 
-The bridge is deliberately small.
-
-You do **not** need to build a complete vendor partition.
-
-You do **not** need to port an entire donor fingerprint HAL.
-
-For a compatible device, the main job is finding the device-specific values and changing them in:
-
-```text
-src/moto_fod_bridge.cpp
-```
-
----
-
-# 4. How the Bridge Works
-
-The current bridge has four main jobs.
-
-## 4.1 Watch the Android fingerprint session
-
-The bridge streams `logcat` and watches for biometric events.
-
-When fingerprint authentication or enrollment starts:
-
-```text
-Sensor Armed
-```
-
-When the fingerprint session ends:
-
-```text
-Sensor Disarmed
-```
-
-The current version also watches additional keyguard and launcher transitions so that the sensor does not remain armed after unlocking.
-
----
-
-## 4.2 Watch the FOD touch event
-
-The bridge reads the Linux input event device:
-
-```text
-/dev/input/eventX
-```
-
-When the FOD hardware reports a touch, the bridge detects the configured keycode.
-
----
-
-## 4.3 Turn on native Local-HBM
-
-When the finger touches the FOD area, the bridge sends:
-
-```text
-DRM_IOCTL_MDSS_DISP_PARAM
-```
-
-to the display device.
-
-On the reference Boston implementation:
-
-```text
-param0 = 2
-param1 = 2
-param2 = 0
-```
-
-This activates the panel's native Local-HBM mode.
-
-The goal is to illuminate only the fingerprint area rather than applying a full-screen software brightness effect.
-
----
-
-## 4.4 Tell the Motorola fingerprint HAL to capture
-
-The bridge loads the Motorola fingerprint library and calls:
-
-```text
-sendFodEvent(0)
-```
-
-when capture starts.
-
-After the optical integration period:
-
-```text
-sendFodEvent(1)
-```
-
-is sent and the display returns to normal mode.
-
----
-
-# 5. Prerequisites
-
-Before trying this project, you should have:
-
-- A Motorola device with an **optical UDFPS/FOD sensor**.
-- A working GSI ROM.
-- The device's stock/compatible vendor partition.
-- Root access.
-- Magisk or KernelSU.
-- Termux.
-- Basic knowledge of running commands as root.
-- A backup of your working firmware/vendor.
-- `clang++`.
-- `git`.
-- `zip`.
-
-Install the basic tools:
-
-```bash
-pkg update
-pkg install clang git zip -y
-```
-
-Check them:
-
-```bash
-clang++ --version
-git --version
-zip -v
-```
-
----
-
-# 6. Before You Start
-
-This project was developed around a **GSI environment**.
-
-The important point is that the GSI and vendor are doing different jobs.
-
-The GSI provides the Android framework/SystemUI.
-
-The vendor partition provides the device-specific hardware implementation.
-
-This bridge is intended to connect the two.
-
-### You should already have:
-
-```text
-GSI boots
-        ↓
-UDFPS overlay works
-        ↓
-Fingerprint icon appears in correct location
-        ↓
-Fingerprint still does not illuminate/read
-        ↓
-Install this bridge
-```
-
-If your fingerprint icon is still showing on the back of the phone, **stop here**.
-
-That is a framework/overlay problem, not a Local-HBM bridge problem.
-
----
-
-# 7. Porting to Your Device
-
-This is the main section if you want to use the project on another Motorola device.
-
-The idea is simple:
-
-> Find the values from your device, replace the corresponding values in `moto_fod_bridge.cpp`, build it, and test it.
-
-Do the steps in order.
-
----
-
-## 7.1 Find the FOD Input Event
-
-Become root:
-
-```bash
+4. How the Bridge Works
+The bridge handles four main tasks:
+ * Watch the Android Biometric Session: Streams logcat for biometric session state (arm/disarm) across system transitions (lockscreen, launcher, apps).
+ * Detect Touch Input: Intercepts kernel input events (/dev/input/eventX) for fingerprint touch signals (e.g., keycode 704 / BTN_TRIGGER_HAPPY).
+ * Trigger DRM Local-HBM: Sends DRM_IOCTL_MDSS_DISP_PARAM ioctl commands to /dev/dri/card0 to toggle hardware-level high brightness on panel pixels over the sensor area.
+ * Communicate with HAL: Calls sendFodEvent(0) / sendFodEvent(1) on the active vendor fingerprint HAL daemon (with fallback support for standard AOSP/Goodix/Jiiov services like android.hardware.biometrics.fingerprint@2.1-service-jv.so).
+5. Prerequisites
+Before starting, ensure you have:
+ * A Motorola device with an optical UDFPS/FOD sensor.
+ * A working GSI ROM installed with a UDFPS overlay applied.
+ * Root access (Magisk, KernelSU, or APatch).
+ * Termux installed.
+ * Basic familiarity with terminal commands.
+6. Automated One-Command Setup & Porting (Recommended)
+An automated tool (port_fod.sh) is included to interactively inspect your hardware, auto-detect touch keycodes, find sysfs nodes, probe running HAL services, calibrate Local-HBM display parameters, update src/moto_fod_bridge.cpp, compile the C++ binary, and build a flashable Magisk ZIP!
+Step-by-Step Instructions to Run the Auto-Porter
+ * Open Termux on your device.
+ * Clone the repository and enter the directory:
+   git clone [https://github.com/Emii31/Motorola-UDFPS-bridge.git](https://github.com/Emii31/Motorola-UDFPS-bridge.git)
+cd Motorola-UDFPS-bridge
+
+ * Run the automated script:
+   bash port_fod.sh
+
+> Note on Root Privileges: The script will automatically request root (su) and configure Termux's execution environment. If you enter su manually before running the script, make sure to execute it with Termux's bash binary path:
+> /data/data/com.termux/files/usr/bin/bash port_fod.sh
+> 
+> 
+What the Automated Script Does:
+ * Auto-installs dependencies: Automatically fetches clang, git, and zip via pkg if missing.
+ * Auto-detects Touch Node & Keycode: Prompts you to hold your finger on the sensor for 7 seconds, then parses /tmp/getevent_test.log to automatically distinguish between keycode 704 (BTN_TRIGGER_HAPPY) and 330 (BTN_TOUCH).
+ * Locates Sysfs Gesture Path: Automatically scans /sys for active fod_en or Goodix gesture control nodes.
+ * GSI HAL Probing: Scans active background processes (ps) and vendor HAL paths to properly target both Motorola extensions (com.motorola.hardware.biometric.fingerprint@1.0.so) and native GSI fallback services (android.hardware.biometrics.fingerprint@2.1-service-jv.so).
+ * Interactive Local-HBM Calibration: Compiles a temporary C binary (test_lhbm.c) and flashes display parameters (2 2 0, 1 1 0, etc.) sequentially. You visually confirm which preset illuminates your panel!
+ * Auto-Patching & Build: Modifies src/moto_fod_bridge.cpp with your device's exact discovered parameters, compiles moto_fod_bridge, and packages out/moto_fod_bridge_module.zip.
+7. Manual Porting to Your Device
+If you prefer to inspect and port values manually instead of using port_fod.sh, follow these steps.
+7.1 Find the FOD Input Event & Keycode
+Run getevent -l in root shell:
 su
-```
-
-Run:
-
-```bash
 getevent -l
-```
 
-Now touch the fingerprint sensor.
-
-You should see input events.
-
-Look for something similar to:
-
-```text
-/dev/input/event10
-```
-
-and a fingerprint-related keycode such as:
-
-```text
-704
-```
-
-or:
-
-```text
-0x2c0
-```
-
-### Example
-
-If your device uses:
-
-```text
-/dev/input/event8
-```
-
-change:
-
-```cpp
+Touch the fingerprint sensor. Identify the input node (e.g., /dev/input/event10) and keycode (e.g., 704 / 0x2c0 or 330 / 0x140).
+In src/moto_fod_bridge.cpp:
 int fd = open("/dev/input/event10", O_RDONLY | O_NONBLOCK);
-```
-
-to:
-
-```cpp
-int fd = open("/dev/input/event8", O_RDONLY | O_NONBLOCK);
-```
-
-Then change the keycode if your device uses a different one:
-
-```cpp
 if (ev.type == EV_KEY && (ev.code == 704 || ev.code == 0x2c0))
-```
 
-Do **not** assume Boston's values are universal.
-
----
-
-## 7.2 Find the FOD Sysfs Node
-
-The reference device uses:
-
-```text
-/sys/devices/platform/goodix_ts.0/gesture/fod_en
-```
-
-Search your device:
-
-```bash
+7.2 Find the FOD Sysfs Node
+Search for your device's FOD enable sysfs node:
 find /sys -iname "*fod*" 2>/dev/null
-```
 
-You can also search for Goodix:
+In src/moto_fod_bridge.cpp:
+static const char* FOD_EN_NODE = "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
 
-```bash
-find /sys -iname "*goodix*" 2>/dev/null
-```
+7.3 Find the Fingerprint Library & GSI Service Fallbacks
+Locate your vendor fingerprint shared library:
+su -c 'ls -l /vendor/lib64/ | grep -i fingerprint'
 
-If your device uses a different path, change:
+ * Stock Motorola HAL: /vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so
+ * GSI / Vendor Service Fallbacks: /vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service-jv.so
+In src/moto_fod_bridge.cpp:
+static const char* TARGET_LIB = "/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so";
 
-```cpp
-static const char* FOD_EN_NODE =
-    "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
-```
-
-to your actual path.
-
-For example:
-
-```cpp
-static const char* FOD_EN_NODE =
-    "/sys/devices/platform/goodix_ts.1/gesture/fod_en";
-```
-
----
-
-## 7.3 Find the Motorola Fingerprint Library
-
-Check:
-
-```bash
-su -c 'ls -l /vendor/lib64/ | grep -i motorola.*fingerprint'
-```
-
-The reference implementation uses:
-
-```text
-/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so
-```
-
-Check it directly:
-
-```bash
-su -c 'ls -l /vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so'
-```
-
-If it exists, that's a good sign.
-
-If your device has a different library/version, the `dlopen()` path and HIDL symbols may need to be changed.
-
-Do **not** randomly change the mangled HIDL symbols.
-
-They must correspond to the actual library/interface on your device.
-
----
-
-## 7.4 Find the Display DRM Node
-
-The reference implementation uses:
-
-```text
-/dev/dri/card0
-```
-
-Check:
-
-```bash
+7.4 Find the Display DRM Node
+Check your display node (typically /dev/dri/card0):
 ls -l /dev/dri/
-```
 
-If the display is exposed through another card, change:
-
-```cpp
-g_drm_fd = open("/dev/dri/card0", O_RDWR);
-```
-
-to the correct device.
-
----
-
-## 7.5 Find the Local-HBM Parameters
-
-This is usually the most device-specific part.
-
-The Boston reference implementation uses:
-
-```text
-param0 = 2
-param1 = 2
-param2 = 0
-```
-
-The source contains these values inside:
-
-```cpp
-set_panel_mode()
-```
-
-### Test program
-
-Create:
-
-```bash
-nano ~/test_lhbm.c
-```
-
-Paste:
-
-```c
+7.5 Calibrate Local-HBM Parameters
+Create test_lhbm.c:
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -521,521 +194,108 @@ struct disp_param_req {
     int32_t value;
 };
 
-int main(int argc, char **argv)
-{
-    if (argc != 4) {
-        printf("Usage: %s <p0> <p1> <p2>\n", argv[0]);
-        return 1;
-    }
-
+int main(int argc, char **argv) {
+    if (argc != 4) return 1;
     int fd = open("/dev/dri/card0", O_RDWR);
-
-    if (fd < 0) {
-        perror("open /dev/dri/card0");
-        return 1;
-    }
+    if (fd < 0) return 1;
 
     struct disp_param_req req;
-
-    req.param_id = 0;
-    req.value = atoi(argv[1]);
+    req.param_id = 0; req.value = atoi(argv[1]);
     ioctl(fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
 
-    req.param_id = 1;
-    req.value = atoi(argv[2]);
+    req.param_id = 1; req.value = atoi(argv[2]);
     ioctl(fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
 
-    req.param_id = 2;
-    req.value = atoi(argv[3]);
+    req.param_id = 2; req.value = atoi(argv[3]);
     ioctl(fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
 
     close(fd);
     return 0;
 }
-```
 
-Compile:
-
-```bash
-clang ~/test_lhbm.c -o ~/test_lhbm
-```
-
-Run as root:
-
-```bash
+Compile and test presets as root:
+clang test_lhbm.c -o test_lhbm
 su
-~/test_lhbm 2 2 0
-```
+./test_lhbm 2 2 0
 
-If the correct parameters are already known for your panel, use them.
-
-If they are not known, **do not blindly try random combinations on your device**.
-
-Look at your stock vendor/display implementation, logs or kernel/display sources to determine which parameters are used for FOD Local-HBM.
-
----
-
-## 7.6 Update the C++ Source
-
-Open:
-
-```bash
-nano src/moto_fod_bridge.cpp
-```
-
-For a typical port, the main values you may need to change are:
-
-### FOD sysfs node
-
-```cpp
-FOD_EN_NODE
-```
-
-### Input event device
-
-```cpp
-/dev/input/event10
-```
-
-### FOD keycode
-
-```cpp
-704
-```
-
-or:
-
-```cpp
-0x2c0
-```
-
-### DRM device
-
-```cpp
-/dev/dri/card0
-```
-
-### Local-HBM parameters
-
-Inside:
-
-```cpp
-set_panel_mode()
-```
-
-### Motorola fingerprint library
-
-```cpp
-/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so
-```
-
-That's the main customization work.
-
-**Do not rewrite the rest of the program unless your device actually requires it.**
-
----
-
-# 8. Build the Project
-
-Clone the repository:
-
-```bash
-git clone https://github.com/Emii31/Motorola-UDFPS-bridge.git
-cd Motorola-UDFPS-bridge
-```
-
-Make the build script executable:
-
-```bash
+Verify if the screen illuminated the fingerprint circle.
+7.6 Update the C++ Source
+Update the values in src/moto_fod_bridge.cpp manually if not using port_fod.sh.
+8. Build the Project
+Run the build script to compile the binary:
 chmod +x build.sh
-```
-
-Run:
-
-```bash
 ./build.sh
-```
 
-The included `build.sh` compiles:
-
-```text
-src/moto_fod_bridge.cpp
-```
-
-into:
-
-```text
-magisk_module/vendor/bin/moto_fod_bridge
-```
-
-The compiler command used is:
-
-```bash
-clang++ -std=c++17 -O3 \
-    src/moto_fod_bridge.cpp \
-    -o magisk_module/vendor/bin/moto_fod_bridge \
-    -lpthread -ldl
-```
-
-If this completes successfully, the native binary is ready for packaging.
-
----
-
-# 9. Build the Magisk Module
-
-Now run:
-
-```bash
+This compiles src/moto_fod_bridge.cpp with C++17 optimizations into magisk_module/vendor/bin/moto_fod_bridge.
+9. Build the Magisk Module
+Generate the flashable Magisk/KernelSU ZIP module:
 chmod +x zip_module.sh
-./zip_module.sh
-```
-
-The flashable ZIP will be created in:
-
-```text
-out/
-```
-
-For example:
-
-```text
-out/Moto_Native_Local_HBM_FOD_Bridge_v4.zip
-```
-
----
-
-# 10. Install the Module
-
-Transfer the generated ZIP to your phone.
-
-Open:
-
-```text
-Magisk
-→ Modules
-→ Install from storage
-```
-
-Select:
-
-```text
-Moto_Native_Local_HBM_FOD_Bridge_v4.zip
-```
-
-Install it.
-
-Then reboot.
-
-The module's `service.sh` starts the bridge automatically after boot.
-
----
-
-# 11. Test the Fingerprint
-
-After reboot, test in this order.
-
-### Test 1 — Fingerprint enrollment
-
-Go to:
-
-```text
-Settings → Security → Fingerprint
-```
-
-Start enrollment.
-
-Touch the fingerprint circle.
-
-You should see:
-
-```text
-Fingerprint area illuminated
-```
-
-and the sensor should begin reading.
-
----
-
-### Test 2 — Unlock
-
-Lock the phone.
-
-Touch the fingerprint area.
-
-The expected sequence is:
-
-```text
-Finger touches sensor
-        ↓
-FOD event detected
-        ↓
-Local-HBM ON
-        ↓
-sendFodEvent(0)
-        ↓
-Optical capture
-        ↓
-~160ms integration
-        ↓
-Local-HBM OFF
-        ↓
-sendFodEvent(1)
-```
-
----
-
-### Test 3 — Normal phone usage
-
-After unlocking, test:
-
-- keyboard
-- scrolling
-- normal touch
-- apps
-- home screen
-
-The FOD hardware should **not** flash every time you touch the display.
-
-This is important because the bridge must only react while a fingerprint session is active.
-
----
-
-# 12. Troubleshooting
-
-## Fingerprint icon is still on the back
-
-This bridge does not fix that.
-
-Fix the GSI UDFPS/framework/SystemUI overlay first.
-
-The expected situation before using this bridge is:
-
-```text
-Fingerprint icon = correct position
-Fingerprint hardware = not working
-```
-
----
-
-## Icon is correct but touching it does nothing
-
-Check:
-
-```bash
-getevent -l
-```
-
-Make sure your `eventX` and keycode match the values in the C++ source.
-
----
-
-## `dlopen failed`
-
-Check:
-
-```bash
-ls -l /vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so
-```
-
-Also check for SELinux denials:
-
-```bash
-dmesg | grep -i avc
-```
-
-The bridge is designed to run through the vendor environment because Android linker namespaces can restrict access to vendor libraries.
-
----
-
-## Local-HBM doesn't turn on
-
-Your panel probably does not use the Boston values:
-
-```text
-2 2 0
-```
-
-Find the correct Local-HBM parameters for your device.
-
----
-
-## HBM works but fingerprint does not enroll
-
-That means the display side is working, but the fingerprint capture side may not be.
-
-Check:
-
-- Motorola fingerprint library.
-- HIDL interface/version.
-- `sendFodEvent()` symbols.
-- FOD payload.
-- Input event.
-- Vendor fingerprint service.
-
----
-
-## HBM keeps flashing while typing or scrolling
-
-The biometric session is probably still armed.
-
-The current bridge already includes several protections:
-
-- authentication end detection
-- enrollment completion detection
-- keyguard transitions
-- launcher transitions
-- enrollment inactivity watchdog
-
-If your GSI uses different log messages, the strings inside:
-
-```cpp
-session_listener_thread()
-```
-
-may need to be adjusted.
-
----
-
-# 13. Boston Reference Values
-
-The original implementation was developed and tested on Motorola **Boston**.
-
-These are the working reference values:
-
-| Component | Boston value |
+bash zip_module.sh
+
+The output file will be generated in out/:
+out/moto_fod_bridge_module.zip
+
+10. Install the Module
+ * Open Magisk, KernelSU, or APatch.
+ * Go to Modules → Install from storage.
+ * Select out/moto_fod_bridge_module.zip.
+ * Flash the module and reboot.
+11. Test the Fingerprint
+ * Enrollment: Go to Settings → Security → Fingerprint. Verify that touching the sensor area triggers Local-HBM illumination and reads your print.
+ * Lockscreen Unlock: Lock your phone and touch the FOD circle. Verify:
+   Touch detected → Local-HBM ON → sendFodEvent(0) → Optical Capture (~160ms) → Local-HBM OFF → sendFodEvent(1)
+
+ * General Usage: Verify that normal screen touches while scrolling or typing do not trigger Local-HBM when no biometric session is active.
+12. Troubleshooting
+ * bash: inaccessible or not found when using su:
+   Android's native root shell does not include Termux paths in its $PATH. Execute the script with the explicit path:
+   /data/data/com.termux/files/usr/bin/bash port_fod.sh
+
+ * Fingerprint icon is on the back of the phone:
+   This is a framework overlay issue, not a bridge issue. Apply a SystemUI/UDFPS overlay for your device first.
+ * dlopen failed or GSI Service Silent Crash:
+   Custom GSIs often run the standard vendor service android.hardware.biometrics.fingerprint@2.1-service-jv.so instead of Motorola extension HALs. port_fod.sh handles this auto-detection during Step 3.
+13. Boston Reference Values
+Reference configuration values for Motorola Boston:
+| Component | Boston Reference Value |
 |---|---|
-| FOD input | `/dev/input/event10` |
-| FOD keycode | `704 / 0x2c0` |
-| FOD sysfs | `/sys/devices/platform/goodix_ts.0/gesture/fod_en` |
-| DRM | `/dev/dri/card0` |
-| Local-HBM | `param0=2, param1=2, param2=0` |
-| Fingerprint library | `/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so` |
-| FOD payload | `0x03` |
-| Capture event | `sendFodEvent(0)` |
-| Release event | `sendFodEvent(1)` |
-| Integration period | ~160ms |
-| Enrollment watchdog | 2.5 seconds |
-
-**These values are not guaranteed to work on another Motorola device.**
-
-They are provided as the reference implementation.
-
----
-
-# 14. Repository Structure
-
-```text
+| FOD Input Node | /dev/input/event10 |
+| Keycode | 704 / 0x2c0 (BTN_TRIGGER_HAPPY) |
+| Sysfs Gesture Node | /sys/devices/platform/goodix_ts.0/gesture/fod_en |
+| DRM Device | /dev/dri/card0 |
+| Local-HBM Presets | param0=2, param1=2, param2=0 |
+| HAL Library | /vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so |
+14. Repository Structure
 Motorola-UDFPS-bridge/
 │
 ├── src/
-│   └── moto_fod_bridge.cpp
+│   └── moto_fod_bridge.cpp      # Main C++ Native Bridge
 │
 ├── magisk_module/
-│   ├── module.prop
-│   ├── service.sh
-│   ├── META-INF/
-│   │   └── com/
-│   │       └── google/
-│   │           └── android/
+│   ├── module.prop              # Magisk module metadata
+│   ├── service.sh               # Late-start service daemon launcher
+│   ├── META-INF/                # Module installer scripts
 │   └── vendor/
 │       └── bin/
-│           └── moto_fod_bridge
+│           └── moto_fod_bridge  # Compiled binary output
 │
-├── build.sh
-├── zip_module.sh
+├── port_fod.sh                  # Interactive automated porter & builder
+├── build.sh                     # Manual C++ compiler script
+├── zip_module.sh                # Module packager script
 ├── LICENSE
 └── README.md
-```
 
----
-
-# 15. Contributing
-
-If you successfully port this to another Motorola device, please share the values you discovered.
-
-A useful report looks like:
-
-```text
+15. Contributing
+Ported this bridge to another Motorola device? Submit a PR or open an issue with your device specifications:
 Device:
-Android version:
-GSI:
-Vendor version:
-Fingerprint vendor:
-FOD input node:
-FOD keycode:
-FOD sysfs node:
-DRM node:
-Local-HBM parameters:
-Fingerprint library:
-```
+Android / GSI Version:
+FOD Input Node:
+Keycode:
+DRM Local-HBM Parameters:
+HAL Library / Service:
 
-This will make future ports much easier.
+16. License
+Licensed under the MIT License.
+17. Disclaimer
+This software modifies display driver parameters and low-level biometric hardware interfaces. Use at your own risk. Always maintain a stock boot/vendor backup before flashing custom hardware modules.
 
----
-
-# 16. License
-
-This project is licensed under the **MIT License**.
-
-See the full license here:
-
-**[LICENSE](LICENSE)**
-
----
-
-# 17. Disclaimer
-
-This project modifies low-level display and fingerprint behavior.
-
-A wrong:
-
-- DRM parameter
-- input event
-- sysfs node
-- vendor library
-- HIDL interface
-- fingerprint event
-
-can cause crashes, broken fingerprint functionality, display problems, or other unexpected behavior.
-
-**Use at your own risk.**
-
-Always keep a working firmware/vendor backup before experimenting.
-
----
-
-# ❤️ Final Note
-
-This project started with:
-
-> **"Why does my GSI think my fingerprint sensor is on the back?"**
-
-I fixed the position with an overlay.
-
-Then came the next problem:
-
-> **"The fingerprint is finally in the right place, but it doesn't illuminate and doesn't read my finger."**
-
-The suggested solution was to port a donor fingerprint HIDL.
-
-Instead, I kept the existing Motorola vendor fingerprint stack and built a small native bridge around it.
-
-The result is this project:
-
-```text
-GSI
- ↓
-Correct UDFPS UI
- ↓
-Native C++ bridge
- ↓
-Local-HBM
- ↓
-Motorola fingerprint HAL
- ↓
-Optical fingerprint sensor
-```
-
-The purpose of this repository is simple:
-
-**If your Motorola device already has the necessary vendor fingerprint components, you should only need to identify your device-specific values, replace them in the C++ source, build the module, and test it.**

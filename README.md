@@ -898,7 +898,3 @@ This project is provided **as-is**, without warranty.
 <p align="center">
   <b>Built from a GSI fingerprint problem — for anyone facing the same problem.</b>
 </p>
-"""
-p = Path("/mnt/data/README.md")
-p.write_text(readme, encoding="utf-8")
-print(f"Created: {p} ({p.stat().st_size} bytes)")

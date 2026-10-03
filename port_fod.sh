@@ -306,7 +306,7 @@ fi
 # Package module ZIP
 if [ -f "zip_module.sh" ]; then
     chmod +x zip_module.sh
-    ./zip_module.sh
+    bash zip_module.sh
 else
     echo -e "${YELLOW}[*] Zipping module...${NC}"
     cd magisk_module

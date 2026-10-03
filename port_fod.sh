@@ -1,5 +1,14 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
+# Ensure Termux PATH is accessible under root
+export PATH=/data/data/com.termux/files/usr/bin:$PATH
+
+if [ "$EUID" -ne 0 ]; then
+    echo "[!] Requesting root privileges..."
+    exec su -c "export PATH=/data/data/com.termux/files/usr/bin:\$PATH; bash $0 $@"
+fi
+
+
 # ==============================================================================
 # Automated Motorola / GSI Local-HBM UDFPS Bridge Porting Tool for Termux
 # ==============================================================================

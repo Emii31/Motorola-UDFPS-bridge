@@ -1,297 +1,211 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <signal.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <linux/input.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
-#include <sys/time.h>
-#include <string>
-#include <functional>
+#include <sys/stat.h>
+#include <linux/input.h>
+#include <stdint.h>
+#include <time.h>
+#include <stdarg.h>
 
+// =============================================================================
+// DRM / IOCTL Definitions
+// =============================================================================
 #define DRM_IOCTL_MDSS_DISP_PARAM 0xc008649f
 
 struct disp_param_req {
     uint32_t param_id;
-    int32_t  value;
+    int32_t value;
 };
+
+// =============================================================================
+// Configuration Targets & Fallbacks
+// =============================================================================
+static const char* INPUT_EVENT_NODE = "/dev/input/event10";
+static int TARGET_KEYCODE = 704;
+
+static const char* SYSFS_FOD_EN = "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
+static const char* DRM_CARD_NODE = "/dev/dri/card0";
+
+// Fallback LHBM Sysfs Paths (QCOM / MediaTek / Generic Panel)
+static const char* SYSFS_LHBM_FALLBACKS[] = {
+    "/sys/class/drm/card0-DSI-1/dimlayer_hbm",
+    "/sys/devices/platform/soc/soc:qcom,dsi-display-primary/hbm",
+    "/sys/class/backlight/panel0-backlight/hbm_mode",
+    "/sys/class/graphics/fb0/hbm",
+    NULL
+};
+
+// Target HAL Shared Libraries
+static const char* TARGET_LIBS[] = {
+    "/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so",
+    "/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service-jv.so",
+    "/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service.so",
+    "/vendor/lib64/hw/fingerprint.default.so",
+    NULL
+};
+
+// Local-HBM Parameters (Calibrated by port_fod.sh)
+static int PARAM_P0 = 2;
+static int PARAM_P1 = 2;
+static int PARAM_P2 = 0;
+
+// =============================================================================
+// Global State & Logging Controls
+// =============================================================================
+static bool g_debug_mode = false;
+static bool g_file_log_mode = false;
+static FILE* g_log_file = NULL;
 
 static int g_drm_fd = -1;
-static atomic_bool g_session_active = ATOMIC_VAR_INIT(false);
-static atomic_bool g_is_enrolling = ATOMIC_VAR_INIT(false);
-static atomic_bool g_running = ATOMIC_VAR_INIT(true);
-static atomic_uint_fast64_t g_last_touch_ms = ATOMIC_VAR_INIT(0);
-static const char* FOD_EN_NODE = "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
+static void* g_hal_handle = NULL;
+typedef void (*sendFodEvent_t)(int);
+static sendFodEvent_t g_sendFodEvent = NULL;
 
-static void set_panel_mode(int mode) {
-    if (g_drm_fd < 0) return;
-    struct disp_param_req req;
-    if (mode == 4) {
-        req.param_id = 0; req.value = 2; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-        req.param_id = 1; req.value = 2; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-        req.param_id = 2; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
+void log_msg(const char* tag, const char* fmt, ...) {
+    va_list args;
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", t);
+
+    char buffer[1024];
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    if (g_debug_mode) {
+        printf("[%s] [%s] %s\n", time_str, tag, buffer);
+        fflush(stdout);
+    }
+
+    if (g_file_log_mode && g_log_file) {
+        fprintf(g_log_file, "[%s] [%s] %s\n", time_str, tag, buffer);
+        fflush(g_log_file);
+    }
+}
+
+// =============================================================================
+// Universal Local-HBM Controller (DRM IOCTL + Multi-Sysfs Fallback)
+// =============================================================================
+void set_local_hbm(bool enable) {
+    bool success = false;
+
+    // Engine 1: DRM IOCTL
+    if (g_drm_fd >= 0) {
+        struct disp_param_req req;
+        
+        req.param_id = 0; req.value = enable ? PARAM_P0 : 0;
+        ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
+
+        req.param_id = 1; req.value = enable ? PARAM_P1 : 0;
+        ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
+
+        req.param_id = 2; req.value = enable ? PARAM_P2 : 0;
+        if (ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req) == 0) {
+            log_msg("LHBM", "DRM IOCTL toggled -> %s", enable ? "ON" : "OFF");
+            success = true;
+        }
+    }
+
+    // Engine 2: Sysfs Fallbacks (If DRM IOCTL unavailable or failed)
+    if (!success) {
+        for (int i = 0; SYSFS_LHBM_FALLBACKS[i] != NULL; i++) {
+            int fd = open(SYSFS_LHBM_FALLBACKS[i], O_WRONLY);
+            if (fd >= 0) {
+                const char* val = enable ? "1" : "0";
+                write(fd, val, strlen(val));
+                close(fd);
+                log_msg("LHBM", "Sysfs [%s] toggled -> %s", SYSFS_LHBM_FALLBACKS[i], val);
+                success = true;
+                break;
+            }
+        }
+    }
+
+    if (!success) {
+        log_msg("ERROR", "Failed to set LHBM state (%s) across all display engines!", enable ? "ON" : "OFF");
+    }
+}
+
+// =============================================================================
+// HAL Resolver
+// =============================================================================
+void init_hal_library() {
+    for (int i = 0; TARGET_LIBS[i] != NULL; i++) {
+        g_hal_handle = dlopen(TARGET_LIBS[i], RTLD_NOW);
+        if (g_hal_handle) {
+            log_msg("HAL", "Successfully loaded HAL library: %s", TARGET_LIBS[i]);
+            g_sendFodEvent = (sendFodEvent_t)dlsym(g_hal_handle, "sendFodEvent");
+            if (g_sendFodEvent) {
+                log_msg("HAL", "Symbol 'sendFodEvent' resolved!");
+            } else {
+                log_msg("WARN", "Loaded %s but 'sendFodEvent' symbol not found.", TARGET_LIBS[i]);
+            }
+            return;
+        }
+    }
+    log_msg("ERROR", "Could not load any compatible vendor fingerprint shared library!");
+}
+
+// =============================================================================
+// Main Execution Engine
+// =============================================================================
+int main(int argc, char** argv) {
+    // Parse Arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
+            g_debug_mode = true;
+        }
+        if (strcmp(argv[i], "--log") == 0 || strcmp(argv[i], "-l") == 0) {
+            g_debug_mode = true;
+            g_file_log_mode = true;
+            g_log_file = fopen("/sdcard/fod_bridge_debug.log", "a");
+        }
+    }
+
+    log_msg("INIT", "Starting Motorola UDFPS Native Bridge Daemon...");
+
+    // Open DRM Card
+    g_drm_fd = open(DRM_CARD_NODE, O_RDWR);
+    if (g_drm_fd >= 0) {
+        log_msg("INIT", "Opened DRM Card: %s", DRM_CARD_NODE);
     } else {
-        req.param_id = 0; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-        req.param_id = 1; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-        req.param_id = 2; req.value = 0; ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
+        log_msg("WARN", "Failed to open DRM card %s. Will rely on Sysfs fallbacks.", DRM_CARD_NODE);
     }
-}
 
-static void write_int_to_file(const char* path, int val) {
-    FILE* f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "%d\n", val);
-        fclose(f);
-    }
-}
+    // Resolve Vendor HAL
+    init_hal_library();
 
-static void handle_exit(int sig) {
-    g_running = false;
-    set_panel_mode(0);
-    write_int_to_file(FOD_EN_NODE, 0);
-    if (g_drm_fd >= 0) close(g_drm_fd);
-    printf("\n[*] Restored display to normal mode.\n");
-    _exit(0);
-}
-
-struct alignas(8) VendorString {
-    unsigned char buf[24];
-    VendorString(const char* str) {
-        memset(buf, 0, sizeof(buf));
-        size_t len = strlen(str);
-        buf[0] = (unsigned char)(len << 1);
-        memcpy(&buf[1], str, len);
-    }
-};
-
-struct alignas(8) HidlVecInt8 {
-    int8_t* mBuffer;
-    uint32_t mSize;
-    bool mOwnsBuffer;
-    uint8_t mPad[3];
-    HidlVecInt8(int8_t* ptr, uint32_t sz)
-        : mBuffer(ptr), mSize(sz), mOwnsBuffer(false) {
-        memset(mPad, 0, sizeof(mPad));
-    }
-};
-
-static void* call_moto_get_service(void* fn_ptr, const VendorString* name, bool get_stub) {
-    void* sp_storage = nullptr;
-    register const VendorString* r_x0 asm("x0") = name;
-    register uint64_t r_x1 asm("x1") = get_stub ? 1 : 0;
-    register void* r_x8 asm("x8") = &sp_storage;
-
-    asm volatile(
-        "blr %3"
-        : "+r"(r_x0), "+r"(r_x1), "+r"(r_x8)
-        : "r"(fn_ptr)
-        : "x2", "x3", "x4", "x5", "x6", "x7", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory"
-    );
-    return sp_storage;
-}
-
-static void call_bphw_send_fod_event(void* fn_ptr, void* instance, int32_t event_type, const HidlVecInt8* vec, void* std_func_ptr) {
-    uint8_t ret_buffer[128];
-    memset(ret_buffer, 0, sizeof(ret_buffer));
-
-    register void* r_x0 asm("x0") = instance;
-    register int64_t r_x1 asm("x1") = event_type;
-    register const HidlVecInt8* r_x2 asm("x2") = vec;
-    register void* r_x3 asm("x3") = std_func_ptr;
-    register void* r_x8 asm("x8") = ret_buffer;
-
-    asm volatile(
-        "blr %5"
-        : "+r"(r_x0), "+r"(r_x1), "+r"(r_x2), "+r"(r_x3), "+r"(r_x8)
-        : "r"(fn_ptr)
-        : "x4", "x5", "x6", "x7", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory"
-    );
-}
-
-static uint64_t get_time_ms() {
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
-}
-
-static void disarm_sensor() {
-    if (atomic_load(&g_session_active)) {
-        atomic_store(&g_session_active, false);
-        atomic_store(&g_is_enrolling, false);
-        set_panel_mode(0);
-        write_int_to_file(FOD_EN_NODE, 0);
-        printf("\n[<<<] BIOMETRIC PROMPT CLOSED -> Sensor Disarmed\n");
-    }
-}
-
-static void arm_sensor(bool enrolling) {
-    atomic_store(&g_is_enrolling, enrolling);
-    atomic_store(&g_last_touch_ms, get_time_ms());
-    if (!atomic_load(&g_session_active)) {
-        atomic_store(&g_session_active, true);
-        write_int_to_file(FOD_EN_NODE, 1);
-        printf("\n[>>>] BIOMETRIC PROMPT ACTIVE -> Sensor Armed (Enroll: %d)\n", enrolling);
-    }
-}
-
-static void* session_listener_thread(void* arg) {
-    FILE* pipe = popen("logcat -v time -b all -s BiometricService:D UdfpsController:D FingerprintService:D AuthService:D KeyguardUpdateMonitor:D KeyguardViewMediator:D wm_task_to_front:I wm_activity_launch_time:I ActivityTaskManager:I", "r");
-    if (!pipe) return nullptr;
-
-    char line[512];
-    while (atomic_load(&g_running) && fgets(line, sizeof(line), pipe)) {
-        // Enrollment start
-        if (strstr(line, "startEnroll") || strstr(line, "enroll(") || strstr(line, "FingerprintEnrollEnrolling")) {
-            arm_sensor(true);
-        }
-        // General auth start
-        else if (strstr(line, "showUdfpsOverlay") || strstr(line, "authenticate")) {
-            arm_sensor(false);
-        } 
-        // Disarming triggers
-        else if (strstr(line, "hideUdfpsOverlay") || 
-                 strstr(line, "onAuthSessionEnded") || 
-                 strstr(line, "onAuthenticated(true)") ||
-                 strstr(line, "keyguardGoingAway") ||
-                 strstr(line, "setKeyguardOccluded(false)") ||
-                 strstr(line, "dismissKeyguard") ||
-                 strstr(line, "startExitAnimation") ||
-                 strstr(line, "FingerprintEnrollFinish") ||
-                 strstr(line, "FingerprintSettings") ||
-                 strstr(line, "onEnrollmentProgress(remaining=0)") ||
-                 strstr(line, "cancelAuthentication") ||
-                 strstr(line, "cancelEnrollment") ||
-                 strstr(line, "resetLockout") ||
-                 strstr(line, "client null") ||
-                 strstr(line, "stopEnroll") ||
-                 strstr(line, "Launcher")) {
-            if (atomic_load(&g_session_active) && !strstr(line, "FingerprintEnrollEnrolling")) {
-                disarm_sensor();
-            }
-        }
-    }
-    pclose(pipe);
-    return nullptr;
-}
-
-// Enrollment Inactivity Guard Thread (Auto-disarms if idle for 2.5 seconds on the Done screen)
-static void* enroll_watchdog_thread(void* arg) {
-    while (atomic_load(&g_running)) {
-        usleep(250000); // 250ms interval
-        if (atomic_load(&g_session_active) && atomic_load(&g_is_enrolling)) {
-            uint64_t now = get_time_ms();
-            uint64_t last = atomic_load(&g_last_touch_ms);
-            // If enrollment completed and no touch on sensor for > 2.5 seconds -> disarm
-            if (now > last && (now - last > 2500)) {
-                printf("\n[⏱️] Enrollment completed / idle timeout reached -> Auto Disarming\n");
-                disarm_sensor();
-            }
-        }
-    }
-    return nullptr;
-}
-
-int main() {
-    signal(SIGINT, handle_exit);
-    signal(SIGTERM, handle_exit);
-
-    g_drm_fd = open("/dev/dri/card0", O_RDWR);
-    if (g_drm_fd < 0) {
-        perror("[-] Failed to open /dev/dri/card0");
+    // Open Input Event Node
+    int input_fd = open(INPUT_EVENT_NODE, O_RDONLY);
+    if (input_fd < 0) {
+        log_msg("ERROR", "Cannot open input node %s! Exiting.", INPUT_EVENT_NODE);
         return 1;
     }
-    set_panel_mode(0);
-    write_int_to_file(FOD_EN_NODE, 0);
-
-    printf("[*] Starting Native LHBM FOD Bridge (v4 - Auto-Disarm Watchdog)...\n");
-
-    void* hidl_lib = dlopen("/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so", RTLD_NOW);
-    if (!hidl_lib) {
-        printf("[-] dlopen failed: %s\n", dlerror());
-        return 1;
-    }
-
-    void* get_svc_sym = dlsym(
-        hidl_lib,
-        "_ZN3com8motorola8hardware9biometric11fingerprint4V1_016IMotoFingerPrint10getServiceERKNSt3__112basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEEb"
-    );
-
-    void* send_fod_sym = dlsym(
-        hidl_lib,
-        "_ZN3com8motorola8hardware9biometric11fingerprint4V1_019BpHwMotoFingerPrint12sendFodEventENS4_16IMotFodEventTypeERKN7android8hardware8hidl_vecIaEENSt3__18functionIFvNS4_18IMotFodEventResultESC_EEE"
-    );
-
-    VendorString svc_name("default");
-    void* motoFpInstance = call_moto_get_service(get_svc_sym, &svc_name, false);
-    if (!motoFpInstance) {
-        printf("[-] Failed to acquire IMotoFingerPrint interface.\n");
-        return 1;
-    }
-    printf("[+] Connected to IMotoFingerPrint HIDL: %p\n", motoFpInstance);
-
-    int fd = open("/dev/input/event10", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        perror("[-] Failed to open /dev/input/event10");
-        return 1;
-    }
-
-    pthread_t listener_tid, watchdog_tid;
-    pthread_create(&listener_tid, nullptr, session_listener_thread, nullptr);
-    pthread_create(&watchdog_tid, nullptr, enroll_watchdog_thread, nullptr);
-
-    printf("[+] Ready for touch events.\n");
-
-    int8_t fod_mode = 0x03;
-    HidlVecInt8 vec(&fod_mode, 1);
-    std::function<void(int32_t, const HidlVecInt8&)> cb = [](int32_t res, const HidlVecInt8& v) {};
+    log_msg("INIT", "Listening for touch events on %s (Keycode: %d)", INPUT_EVENT_NODE, TARGET_KEYCODE);
 
     struct input_event ev;
-    bool is_touch_active = false;
-    uint64_t last_touch_ms = 0;
-    int touch_count = 0;
-
-    while (g_running) {
-        uint64_t now = get_time_ms();
-
-        while (read(fd, &ev, sizeof(struct input_event)) > 0) {
-            if (!atomic_load(&g_session_active)) {
-                continue;
-            }
-
-            if (ev.type == EV_KEY && (ev.code == 704 || ev.code == 0x2c0)) {
-                if (ev.value == 1) { // Touch DOWN
-                    last_touch_ms = now;
-                    atomic_store(&g_last_touch_ms, now);
-
-                    if (!is_touch_active) {
-                        is_touch_active = true;
-                        touch_count++;
-
-                        set_panel_mode(4);
-                        printf("[+] [%d] Local-HBM ON -> sendFodEvent(0)\n", touch_count);
-                        call_bphw_send_fod_event(send_fod_sym, motoFpInstance, 0, &vec, &cb);
-                    }
-                }
+    while (read(input_fd, &ev, sizeof(ev)) > 0) {
+        if (ev.type == EV_KEY && (ev.code == TARGET_KEYCODE || ev.code == 0x2c0 || ev.code == 0x140)) {
+            if (ev.value == 1) { // Touch down
+                log_msg("TOUCH", "Finger Down Detected!");
+                set_local_hbm(true);
+                if (g_sendFodEvent) g_sendFodEvent(0);
+            } else if (ev.value == 0) { // Touch release
+                log_msg("TOUCH", "Finger Lift Detected!");
+                set_local_hbm(false);
+                if (g_sendFodEvent) g_sendFodEvent(1);
             }
         }
-
-        // Release timeout for optical frame integration (~160ms)
-        if (is_touch_active && (now - last_touch_ms > 160)) {
-            is_touch_active = false;
-            set_panel_mode(0);
-            printf("[-] [%d] Normal Restore -> sendFodEvent(1)\n", touch_count);
-            call_bphw_send_fod_event(send_fod_sym, motoFpInstance, 1, &vec, &cb);
-        }
-
-        usleep(2000);
     }
 
-    close(fd);
+    if (g_log_file) fclose(g_log_file);
+    close(input_fd);
     if (g_drm_fd >= 0) close(g_drm_fd);
     return 0;
 }

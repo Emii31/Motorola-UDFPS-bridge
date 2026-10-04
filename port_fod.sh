@@ -26,6 +26,7 @@ echo -e "${BLUE}======================================================${NC}"
 echo -e "${BLUE} Motorola Universal GSI FOD Hardware Scanner & Porter ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 
+# Profile handling: explicit parameter OR exact Boston hardware match
 DEVICE_CODENAME=$(getprop ro.product.device)
 if [ "$1" == "--profile" ] && [ -n "$2" ]; then
     PROF_FILE="profiles/$2.conf"
@@ -42,36 +43,47 @@ elif [ "$DEVICE_CODENAME" == "boston" ]; then
     source "profiles/boston.conf"
 fi
 
-# 1. Device-Agnostic Input Discovery
+# 1. Device-Agnostic Input Discovery with Fingerprint-Targeted Filtering
 if [ -z "$INPUT_NODE" ]; then
-    echo -e "\n${BLUE}[Step 1/5] Scanning Input Devices...${NC}"
+    echo -e "\n${BLUE}[Step 1/5] Scanning Input Devices for Fingerprint/FOD Controller...${NC}"
     for ev in /dev/input/event*; do
         NAME=$(getevent -p "$ev" 2>/dev/null | grep "name:" | cut -d'"' -f2)
-        if echo "$NAME" | grep -i -E "fingerprint|goodix|fod" >/dev/null; then
+        if echo "$NAME" | grep -i -E "fingerprint|goodix|fod|fpc" >/dev/null; then
             INPUT_NODE="$ev"
-            echo -e "${GREEN}[✓] Discovered Sensor Node: $ev ($NAME)${NC}"
+            echo -e "${GREEN}[✓] Pinned Sensor Node: $ev ($NAME)${NC}"
             break
         fi
     done
 fi
 
 if [ -n "$INPUT_NODE" ] && [ -z "$TARGET_KEYCODE" ]; then
-    echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor on screen now (5 sec test)...${NC}"
+    echo -e "${YELLOW}👉 Touch and HOLD the fingerprint sensor on screen now (5 sec test)...${NC}"
     
-    # Capture raw numeric event code directly from getevent
-    HEX_CODE=$(getevent -c 5 "$INPUT_NODE" 2>/dev/null | grep " 0001 " | head -n 1 | awk '{print $3}')
+    # Target strictly $INPUT_NODE and filter specifically for EV_KEY (type 0001)
+    # getevent output format: "0001  02c0  00000001"
+    EV_LOG="/tmp/fod_ev_test.log"
+    getevent -c 15 "$INPUT_NODE" 2>/dev/null | grep " 0001 " > "$EV_LOG" &
+    GE_PID=$!
+    sleep 5
+    kill $GE_PID 2>/dev/null || true
+
+    # Extract the captured EV_KEY code column ($2 in hex)
+    HEX_CODE=$(head -n 1 "$EV_LOG" | awk '{print $2}')
     
     if [ -n "$HEX_CODE" ]; then
         TARGET_KEYCODE=$((16#$HEX_CODE))
-        echo -e "${GREEN}[✓] Discovered Numeric Keycode: $TARGET_KEYCODE (Raw Hex: 0x$HEX_CODE)${NC}"
+        echo -e "${GREEN}[✓] Verified Sensor Keycode: $TARGET_KEYCODE (Raw Hex: 0x$HEX_CODE)${NC}"
     fi
+    rm -f "$EV_LOG"
 fi
 
+# Hard Stop: Exit if input node or keycode discovery fails
 if [ -z "$INPUT_NODE" ] || [ -z "$TARGET_KEYCODE" ]; then
     echo -e "\n${RED}[X] Unknown Device / Input Discovery Failed!${NC}"
     echo -e "${RED}[X] Could not auto-detect fingerprint input node or target keycode.${NC}"
     echo -e "${YELLOW}👉 Supply a valid profile: 'bash port_fod.sh --profile <profile_name>'${NC}"
     log_report "Status: DISCOVERY FAILED (Input Node / Keycode Unverified)"
+    echo -e "${GREEN}[✓] Diagnostic report written to: $REPORT_FILE${NC}"
     exit 1
 fi
 
@@ -92,7 +104,7 @@ else
     log_report "Sysfs Node: $SYSFS_FOD_EN"
 fi
 
-# 3. Display Driver Engine
+# 3. Display Driver Engine Setup
 DRM_CARD_NODE=${DRM_CARD_NODE:-"/dev/dri/card0"}
 P0=${LHBM_PARAM_P0:-2}
 P1=${LHBM_PARAM_P1:-2}

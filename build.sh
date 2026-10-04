@@ -1,6 +1,20 @@
-#!/bin/bash
-set -e
-echo "[*] Compiling Motorola Native LHBM FOD Bridge..."
-clang++ -std=c++17 -O3 src/moto_fod_bridge.cpp -o magisk_module/vendor/bin/moto_fod_bridge -lpthread -ldl
-chmod 755 magisk_module/vendor/bin/moto_fod_bridge
-echo "[+] Compiled successfully -> magisk_module/vendor/bin/moto_fod_bridge"
+#!/data/data/com.termux/files/usr/bin/bash
+
+export PATH=/data/data/com.termux/files/usr/bin:$PATH
+
+mkdir -p magisk_module/vendor/bin
+
+echo "[*] Compiling Motorola UDFPS Bridge C++ Daemon..."
+
+clang++ -std=c++17 -O3 \
+    -Iinclude \
+    src/moto_fod_bridge.cpp \
+    -o magisk_module/vendor/bin/moto_fod_bridge \
+    -lpthread -ldl
+
+if [ -f "magisk_module/vendor/bin/moto_fod_bridge" ]; then
+    echo "[✓] Compilation succeeded: magisk_module/vendor/bin/moto_fod_bridge"
+else
+    echo "[X] Compilation failed!"
+    exit 1
+fi

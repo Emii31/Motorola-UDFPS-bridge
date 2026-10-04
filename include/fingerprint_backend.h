@@ -1,8 +1,6 @@
 #ifndef FINGERPRINT_BACKEND_H
 #define FINGERPRINT_BACKEND_H
 
-#include <stdint.h>
-
 class IFingerprintBackend {
 public:
     virtual ~IFingerprintBackend() {}
@@ -12,7 +10,7 @@ public:
 };
 
 // Factory functions
-IFingerprintBackend* createMotorolaHidlBackend();
+IFingerprintBackend* createMotorolaHidlBackend(const char* lib_path);
 IFingerprintBackend* createAospHidlBackend();
 
 #endif // FINGERPRINT_BACKEND_H

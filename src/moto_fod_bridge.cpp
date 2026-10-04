@@ -31,7 +31,7 @@ static int TARGET_KEYCODE = 704;
 static const char* SYSFS_FOD_EN = "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
 static const char* DRM_CARD_NODE = "/dev/dri/card0";
 
-// Fallback LHBM Sysfs Paths (QCOM / MediaTek / Generic Panel)
+// Fallback LHBM Sysfs Paths (Qualcomm / MediaTek / Generic Panel Backlight)
 static const char* SYSFS_LHBM_FALLBACKS[] = {
     "/sys/class/drm/card0-DSI-1/dimlayer_hbm",
     "/sys/devices/platform/soc/soc:qcom,dsi-display-primary/hbm",
@@ -40,7 +40,7 @@ static const char* SYSFS_LHBM_FALLBACKS[] = {
     NULL
 };
 
-// Target HAL Shared Libraries
+// Target HAL Shared Libraries (Motorola Extensions + GSI Vendor Daemons)
 static const char* TARGET_LIBS[] = {
     "/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so",
     "/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service-jv.so",
@@ -49,7 +49,7 @@ static const char* TARGET_LIBS[] = {
     NULL
 };
 
-// Local-HBM Parameters (Calibrated by port_fod.sh)
+// Local-HBM Parameters (Calibrated during setup)
 static int PARAM_P0 = 2;
 static int PARAM_P1 = 2;
 static int PARAM_P2 = 0;
@@ -90,12 +90,12 @@ void log_msg(const char* tag, const char* fmt, ...) {
 }
 
 // =============================================================================
-// Universal Local-HBM Controller (DRM IOCTL + Multi-Sysfs Fallback)
+// Universal Local-HBM Controller (DRM IOCTL + Multi-Sysfs Fallback Engine)
 // =============================================================================
 void set_local_hbm(bool enable) {
     bool success = false;
 
-    // Engine 1: DRM IOCTL
+    // Engine 1: Qualcomm DRM IOCTL
     if (g_drm_fd >= 0) {
         struct disp_param_req req;
         
@@ -112,7 +112,7 @@ void set_local_hbm(bool enable) {
         }
     }
 
-    // Engine 2: Sysfs Fallbacks (If DRM IOCTL unavailable or failed)
+    // Engine 2: Sysfs Fallbacks (MediaTek / Generic Panels)
     if (!success) {
         for (int i = 0; SYSFS_LHBM_FALLBACKS[i] != NULL; i++) {
             int fd = open(SYSFS_LHBM_FALLBACKS[i], O_WRONLY);
@@ -127,13 +127,22 @@ void set_local_hbm(bool enable) {
         }
     }
 
+    // Engine 3: Touch Gesture Enable Sysfs Toggle
+    int fod_fd = open(SYSFS_FOD_EN, O_WRONLY);
+    if (fod_fd >= 0) {
+        const char* val = enable ? "1" : "0";
+        write(fod_fd, val, strlen(val));
+        close(fod_fd);
+        log_msg("GESTURE", "FOD Sysfs Node [%s] toggled -> %s", SYSFS_FOD_EN, val);
+    }
+
     if (!success) {
         log_msg("ERROR", "Failed to set LHBM state (%s) across all display engines!", enable ? "ON" : "OFF");
     }
 }
 
 // =============================================================================
-// HAL Resolver
+// Dynamic HAL Resolver
 // =============================================================================
 void init_hal_library() {
     for (int i = 0; TARGET_LIBS[i] != NULL; i++) {
@@ -153,10 +162,10 @@ void init_hal_library() {
 }
 
 // =============================================================================
-// Main Execution Engine
+// Main Execution Daemon
 // =============================================================================
 int main(int argc, char** argv) {
-    // Parse Arguments
+    // Parse Arguments for Debug / Logging
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
             g_debug_mode = true;
@@ -170,7 +179,7 @@ int main(int argc, char** argv) {
 
     log_msg("INIT", "Starting Motorola UDFPS Native Bridge Daemon...");
 
-    // Open DRM Card
+    // Initialize DRM Display Engine
     g_drm_fd = open(DRM_CARD_NODE, O_RDWR);
     if (g_drm_fd >= 0) {
         log_msg("INIT", "Opened DRM Card: %s", DRM_CARD_NODE);
@@ -178,25 +187,25 @@ int main(int argc, char** argv) {
         log_msg("WARN", "Failed to open DRM card %s. Will rely on Sysfs fallbacks.", DRM_CARD_NODE);
     }
 
-    // Resolve Vendor HAL
+    // Resolve Fingerprint HAL
     init_hal_library();
 
-    // Open Input Event Node
+    // Open Kernel Touch Event Node
     int input_fd = open(INPUT_EVENT_NODE, O_RDONLY);
     if (input_fd < 0) {
         log_msg("ERROR", "Cannot open input node %s! Exiting.", INPUT_EVENT_NODE);
         return 1;
     }
-    log_msg("INIT", "Listening for touch events on %s (Keycode: %d)", INPUT_EVENT_NODE, TARGET_KEYCODE);
+    log_msg("INIT", "Listening for touch events on %s (Target Keycode: %d)", INPUT_EVENT_NODE, TARGET_KEYCODE);
 
     struct input_event ev;
     while (read(input_fd, &ev, sizeof(ev)) > 0) {
         if (ev.type == EV_KEY && (ev.code == TARGET_KEYCODE || ev.code == 0x2c0 || ev.code == 0x140)) {
-            if (ev.value == 1) { // Touch down
+            if (ev.value == 1) { // Touch down event
                 log_msg("TOUCH", "Finger Down Detected!");
                 set_local_hbm(true);
                 if (g_sendFodEvent) g_sendFodEvent(0);
-            } else if (ev.value == 0) { // Touch release
+            } else if (ev.value == 0) { // Touch release event
                 log_msg("TOUCH", "Finger Lift Detected!");
                 set_local_hbm(false);
                 if (g_sendFodEvent) g_sendFodEvent(1);

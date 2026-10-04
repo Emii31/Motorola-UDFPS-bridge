@@ -26,7 +26,7 @@ echo -e "${BLUE}======================================================${NC}"
 echo -e "${BLUE} Motorola Universal GSI FOD Hardware Scanner & Porter ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 
-# Check for explicit profile argument OR exact Boston device match
+# Profile handling: explicit parameter OR exact Boston hardware match
 DEVICE_CODENAME=$(getprop ro.product.device)
 if [ "$1" == "--profile" ] && [ -n "$2" ]; then
     PROF_FILE="profiles/$2.conf"
@@ -35,10 +35,11 @@ if [ "$1" == "--profile" ] && [ -n "$2" ]; then
         source "$PROF_FILE"
     else
         echo -e "${RED}[X] Profile $PROF_FILE not found! Exiting.${NC}"
+        log_report "Status: ERROR (Profile $2 not found)"
         exit 1
     fi
 elif [ "$DEVICE_CODENAME" == "boston" ]; then
-    echo -e "${GREEN}[✓] Detected 'boston' hardware. Loading profiles/boston.conf${NC}"
+    echo -e "${GREEN}[✓] Detected 'boston' hardware (Moto G Stylus 5G 2024). Loading profiles/boston.conf${NC}"
     source "profiles/boston.conf"
 fi
 
@@ -74,30 +75,38 @@ if [ -n "$INPUT_NODE" ] && [ -z "$TARGET_KEYCODE" ]; then
     fi
 fi
 
-# Hard Stop: No Boston default assumptions for unknown devices
+# Hard Stop: Stop if input discovery fails
 if [ -z "$INPUT_NODE" ] || [ -z "$TARGET_KEYCODE" ]; then
-    echo -e "\n${RED}[X] Unknown Device / Discovery Failed!${NC}"
-    echo -e "${RED}[X] Input node or target keycode could not be verified automatically.${NC}"
-    echo -e "${YELLOW}👉 To run on this device, pass a valid profile: 'bash port_fod.sh --profile <profile_name>'${NC}"
-    log_report "Status: DISCOVERY FAILED (Unknown Device)"
-    echo -e "${GREEN}[✓] Report generated at: $REPORT_FILE${NC}"
+    echo -e "\n${RED}[X] Unknown Device / Input Discovery Failed!${NC}"
+    echo -e "${RED}[X] Could not auto-detect fingerprint input node or keycode.${NC}"
+    echo -e "${YELLOW}👉 Supply a valid profile: 'bash port_fod.sh --profile <profile_name>'${NC}"
+    log_report "Status: DISCOVERY FAILED (Input Node / Keycode Unverified)"
+    echo -e "${GREEN}[✓] Diagnostic report written to: $REPORT_FILE${NC}"
     exit 1
 fi
 
 log_report "Input Device: $INPUT_NODE (Keycode: $TARGET_KEYCODE)"
 
-# 2. Sysfs FOD Control Discovery
+# 2. Sysfs FOD Control Discovery (No implicit Boston fallback)
 if [ -z "$SYSFS_FOD_EN" ]; then
     echo -e "\n${BLUE}[Step 2/5] Locating Sysfs Control Node...${NC}"
     SYSFS_FOD_EN=$(find /sys -iname "*fod_en*" 2>/dev/null | head -n 1)
 fi
-SYSFS_FOD_EN=${SYSFS_FOD_EN:-"/sys/devices/platform/goodix_ts.0/gesture/fod_en"}
-log_report "Sysfs Node: $SYSFS_FOD_EN"
 
-# 3. Display Driver Engine Setup (Qualcomm DRM IOCTL Baseline)
+if [ -z "$SYSFS_FOD_EN" ]; then
+    echo -e "${YELLOW}[!] Warning: No Sysfs FOD control node discovered.${NC}"
+    log_report "Sysfs Node: NONE (DRM Engine will be primary)"
+else
+    echo -e "${GREEN}[✓] Discovered Sysfs Node: $SYSFS_FOD_EN${NC}"
+    log_report "Sysfs Node: $SYSFS_FOD_EN"
+fi
+
+# 3. Display Driver Engine Setup (Explicitly marked as default or profile-supplied)
 DRM_CARD_NODE=${DRM_CARD_NODE:-"/dev/dri/card0"}
-P0=${LHBM_PARAM_P0:-2}; P1=${LHBM_PARAM_P1:-2}; P2=${LHBM_PARAM_P2:-0}
-log_report "Display Engine: Qualcomm DRM $DRM_CARD_NODE [P0=$P0, P1=$P1, P2=$P2]"
+P0=${LHBM_PARAM_P0:-2}
+P1=${LHBM_PARAM_P1:-2}
+P2=${LHBM_PARAM_P2:-0}
+log_report "Display Engine: DRM $DRM_CARD_NODE [P0=$P0, P1=$P1, P2=$P2]"
 
 # 4. Fingerprint Backend Selection
 FINGERPRINT_LIB=${FINGERPRINT_LIB:-"/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"}
@@ -108,7 +117,7 @@ else
 fi
 log_report "Fingerprint Backend: $FP_BACKEND"
 
-# 5. Generate Header: include/device_config.h
+# 5. Header Generation
 echo -e "\n${BLUE}[Step 5/5] Generating Header: include/device_config.h ...${NC}"
 mkdir -p include
 
@@ -119,7 +128,7 @@ cat << EOF > include/device_config.h
 #define CONFIG_INPUT_NODE "$INPUT_NODE"
 #define CONFIG_TARGET_KEYCODE $TARGET_KEYCODE
 
-#define CONFIG_SYSFS_FOD_EN "$SYSFS_FOD_EN"
+#define CONFIG_SYSFS_FOD_EN "${SYSFS_FOD_EN:-/dev/null}"
 #define CONFIG_DRM_CARD_NODE "$DRM_CARD_NODE"
 
 #define CONFIG_LHBM_PARAM_P0 $P0
@@ -139,4 +148,4 @@ echo -e "${GREEN}[✓] Header include/device_config.h successfully generated!${N
 if [ -f "build.sh" ]; then bash build.sh; fi
 if [ -f "zip_module.sh" ]; then bash zip_module.sh; fi
 
-echo -e "\n${GREEN}[✓] Porting complete. Report written to: $REPORT_FILE${NC}"
+echo -e "\n${GREEN}[✓] Porting complete. Diagnostic report written to: $REPORT_FILE${NC}"

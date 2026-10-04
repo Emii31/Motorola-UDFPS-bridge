@@ -12,18 +12,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Profile argument support
-if [ "$1" == "--profile" ] && [ -n "$2" ]; then
-    PROF_FILE="profiles/$2.conf"
-    if [ -f "$PROF_FILE" ]; then
-        echo -e "${GREEN}[✓] Loading requested profile: $PROF_FILE${NC}"
-        source "$PROF_FILE"
-    else
-        echo -e "${RED}[X] Profile $PROF_FILE not found! Exiting.${NC}"
-        exit 1
-    fi
-fi
-
 REPORT_FILE="fod_port_report.txt"
 rm -f "$REPORT_FILE"
 
@@ -37,6 +25,22 @@ log_report "----------------------------------------"
 echo -e "${BLUE}======================================================${NC}"
 echo -e "${BLUE} Motorola Universal GSI FOD Hardware Scanner & Porter ${NC}"
 echo -e "${BLUE}======================================================${NC}"
+
+# Check for explicit profile argument OR exact Boston device match
+DEVICE_CODENAME=$(getprop ro.product.device)
+if [ "$1" == "--profile" ] && [ -n "$2" ]; then
+    PROF_FILE="profiles/$2.conf"
+    if [ -f "$PROF_FILE" ]; then
+        echo -e "${GREEN}[✓] Loading requested profile: $PROF_FILE${NC}"
+        source "$PROF_FILE"
+    else
+        echo -e "${RED}[X] Profile $PROF_FILE not found! Exiting.${NC}"
+        exit 1
+    fi
+elif [ "$DEVICE_CODENAME" == "boston" ]; then
+    echo -e "${GREEN}[✓] Detected 'boston' hardware. Loading profiles/boston.conf${NC}"
+    source "profiles/boston.conf"
+fi
 
 # 1. Device-Agnostic Input Discovery
 if [ -z "$INPUT_NODE" ]; then
@@ -59,10 +63,8 @@ if [ -n "$INPUT_NODE" ] && [ -z "$TARGET_KEYCODE" ]; then
     sleep 5
     kill $GE_PID 2>/dev/null || true
 
-    # Parse numerical event code from raw event dump
     RAW_CODE=$(grep "EV_KEY" "$EV_LOG" | head -n 1 | awk '{print $3}')
     if [ -n "$RAW_CODE" ]; then
-        # Convert hex keycode representation if necessary
         if [[ "$RAW_CODE" == KEY_* ]]; then
             TARGET_KEYCODE=704
         else
@@ -72,11 +74,13 @@ if [ -n "$INPUT_NODE" ] && [ -z "$TARGET_KEYCODE" ]; then
     fi
 fi
 
-# Halt if hardware scanner fails rather than silently loading defaults
+# Hard Stop: No Boston default assumptions for unknown devices
 if [ -z "$INPUT_NODE" ] || [ -z "$TARGET_KEYCODE" ]; then
-    echo -e "\n${RED}[X] Automatic input discovery failed!${NC}"
-    echo -e "${YELLOW}Run with '--profile boston' if using the Motorola Moto G Stylus 5G reference device.${NC}"
-    log_report "Status: INPUT DISCOVERY FAILED"
+    echo -e "\n${RED}[X] Unknown Device / Discovery Failed!${NC}"
+    echo -e "${RED}[X] Input node or target keycode could not be verified automatically.${NC}"
+    echo -e "${YELLOW}👉 To run on this device, pass a valid profile: 'bash port_fod.sh --profile <profile_name>'${NC}"
+    log_report "Status: DISCOVERY FAILED (Unknown Device)"
+    echo -e "${GREEN}[✓] Report generated at: $REPORT_FILE${NC}"
     exit 1
 fi
 
@@ -90,10 +94,10 @@ fi
 SYSFS_FOD_EN=${SYSFS_FOD_EN:-"/sys/devices/platform/goodix_ts.0/gesture/fod_en"}
 log_report "Sysfs Node: $SYSFS_FOD_EN"
 
-# 3. DRM Parameter Calibration
+# 3. Display Driver Engine Setup (Qualcomm DRM IOCTL Baseline)
 DRM_CARD_NODE=${DRM_CARD_NODE:-"/dev/dri/card0"}
 P0=${LHBM_PARAM_P0:-2}; P1=${LHBM_PARAM_P1:-2}; P2=${LHBM_PARAM_P2:-0}
-log_report "Display Engine: DRM $DRM_CARD_NODE [P0=$P0, P1=$P1, P2=$P2]"
+log_report "Display Engine: Qualcomm DRM $DRM_CARD_NODE [P0=$P0, P1=$P1, P2=$P2]"
 
 # 4. Fingerprint Backend Selection
 FINGERPRINT_LIB=${FINGERPRINT_LIB:-"/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"}
@@ -135,4 +139,4 @@ echo -e "${GREEN}[✓] Header include/device_config.h successfully generated!${N
 if [ -f "build.sh" ]; then bash build.sh; fi
 if [ -f "zip_module.sh" ]; then bash zip_module.sh; fi
 
-echo -e "\n${GREEN}[✓] Report written to: $REPORT_FILE${NC}"
+echo -e "\n${GREEN}[✓] Porting complete. Report written to: $REPORT_FILE${NC}"

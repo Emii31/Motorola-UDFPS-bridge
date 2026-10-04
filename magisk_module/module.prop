@@ -2,5 +2,5 @@ id=moto_native_lhbm_fod
 name=Motorola Native Local-HBM FOD Bridge
 version=v4.0
 versionCode=40
-author=Emii31
+author=Emii31 (Md Emam Hossain)
 description=Native hardware Local-HBM optical fingerprint (UDFPS) support for Motorola devices running GSI/AOSP custom ROMs.

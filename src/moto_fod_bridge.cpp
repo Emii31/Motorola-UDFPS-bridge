@@ -13,6 +13,7 @@
 #include "../include/fingerprint_backend.h"
 
 static bool g_debug_mode = false;
+static bool g_allow_standalone = false;
 static bool g_file_log_mode = false;
 static FILE* g_log_file = nullptr;
 
@@ -108,6 +109,7 @@ void* logcat_session_listener(void* arg) {
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) g_debug_mode = true;
+        if (strcmp(argv[i], "--standalone") == 0) g_allow_standalone = true;
         if (strcmp(argv[i], "--log") == 0 || strcmp(argv[i], "-l") == 0) {
             g_debug_mode = true; g_file_log_mode = true;
             g_log_file = fopen("/sdcard/fod_bridge_debug.log", "a");
@@ -116,27 +118,35 @@ int main(int argc, char** argv) {
 
     log_msg("INIT", "Starting Universal Motorola UDFPS Bridge Daemon...");
 
-    // Instantiate LHBM Backend
+    // Initialize Display Engine
     g_display_engine = createDrmLhbmBackend(CONFIG_DRM_CARD_NODE, CONFIG_LHBM_PARAM_P0, CONFIG_LHBM_PARAM_P1, CONFIG_LHBM_PARAM_P2);
     if (!g_display_engine->initialize()) {
         log_msg("WARN", "DRM Driver failed to initialize. Falling back to Sysfs.");
         delete g_display_engine;
         g_display_engine = createSysfsLhbmBackend(CONFIG_SYSFS_FOD_EN);
-        g_display_engine->initialize();
+        if (!g_display_engine->initialize()) {
+            log_msg("FATAL", "Display backend initialization failed! Stopping execution.");
+            return 1;
+        }
     }
     log_msg("INIT", "Loaded Display Backend: %s", g_display_engine->getName());
 
-    // Instantiate Fingerprint Backend
+    // Initialize Fingerprint Engine
     if (strcmp(CONFIG_FINGERPRINT_BACKEND, "motorola_hidl") == 0) {
         g_fingerprint_engine = createMotorolaHidlBackend(CONFIG_FINGERPRINT_LIB_PATH);
     } else {
         g_fingerprint_engine = createAospHidlBackend();
     }
 
-    if (g_fingerprint_engine && g_fingerprint_engine->initialize()) {
-        log_msg("INIT", "Loaded Fingerprint Backend: %s", g_fingerprint_engine->getName());
+    if (!g_fingerprint_engine || !g_fingerprint_engine->initialize()) {
+        if (g_allow_standalone) {
+            log_msg("WARN", "Fingerprint Backend failed. Running LHBM standalone diagnostic mode.");
+        } else {
+            log_msg("FATAL", "Fingerprint backend initialization failed! Stopping daemon (Use --standalone for LHBM-only testing).");
+            return 1;
+        }
     } else {
-        log_msg("WARN", "Fingerprint Backend failed. Running LHBM standalone mode.");
+        log_msg("INIT", "Loaded Fingerprint Backend: %s", g_fingerprint_engine->getName());
     }
 
     pthread_t logcat_t, watchdog_t;
@@ -145,7 +155,7 @@ int main(int argc, char** argv) {
 
     int input_fd = open(CONFIG_INPUT_NODE, O_RDONLY | O_NONBLOCK);
     if (input_fd < 0) {
-        log_msg("ERROR", "Failed to open input device %s!", CONFIG_INPUT_NODE);
+        log_msg("FATAL", "Failed to open input device %s!", CONFIG_INPUT_NODE);
         return 1;
     }
 

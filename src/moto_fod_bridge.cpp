@@ -11,6 +11,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdbool.h>
+
+#include "../include/device_config.h"
 
 // =============================================================================
 // DRM / IOCTL Definitions
@@ -23,15 +26,8 @@ struct disp_param_req {
 };
 
 // =============================================================================
-// Configuration Targets & Fallbacks
+// Fallback Paths
 // =============================================================================
-static const char* INPUT_EVENT_NODE = "/dev/input/event10";
-static int TARGET_KEYCODE = 704;
-
-static const char* SYSFS_FOD_EN = "/sys/devices/platform/goodix_ts.0/gesture/fod_en";
-static const char* DRM_CARD_NODE = "/dev/dri/card0";
-
-// Fallback LHBM Sysfs Paths (Qualcomm / MediaTek / Generic Panel Backlight)
 static const char* SYSFS_LHBM_FALLBACKS[] = {
     "/sys/class/drm/card0-DSI-1/dimlayer_hbm",
     "/sys/devices/platform/soc/soc:qcom,dsi-display-primary/hbm",
@@ -40,7 +36,6 @@ static const char* SYSFS_LHBM_FALLBACKS[] = {
     NULL
 };
 
-// Target HAL Shared Libraries (Motorola Extensions + GSI Vendor Daemons)
 static const char* TARGET_LIBS[] = {
     "/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so",
     "/vendor/lib64/hw/android.hardware.biometrics.fingerprint@2.1-service-jv.so",
@@ -49,22 +44,30 @@ static const char* TARGET_LIBS[] = {
     NULL
 };
 
-// Local-HBM Parameters (Calibrated during setup)
-static int PARAM_P0 = 2;
-static int PARAM_P1 = 2;
-static int PARAM_P2 = 0;
+// Known Motorola HIDL C++ Mangled Symbols for BpHwMotoFingerPrint::sendFodEvent(int32_t)
+static const char* MOTO_HIDL_SYMBOLS[] = {
+    "_ZN8android8hardware9biometrics11fingerprintV1_020BpHwMotoFingerPrint12sendFodEventEi",
+    "_ZN7vendor8motorola8hardware9biometrics11fingerprintV1_020BpHwMotoFingerPrint12sendFodEventEi",
+    "sendFodEvent", // Direct fallback
+    NULL
+};
 
 // =============================================================================
-// Global State & Logging Controls
+// Global State & Session Gating
 // =============================================================================
 static bool g_debug_mode = false;
 static bool g_file_log_mode = false;
 static FILE* g_log_file = NULL;
 
+static bool g_session_active = false;
+static pthread_mutex_t g_session_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int g_drm_fd = -1;
 static void* g_hal_handle = NULL;
-typedef void (*sendFodEvent_t)(int);
-static sendFodEvent_t g_sendFodEvent = NULL;
+
+// Function Pointer Signature for HIDL Call (thisptr, fod_cmd)
+typedef void (*moto_sendFodEvent_t)(void*, int32_t);
+static moto_sendFodEvent_t g_sendFodEvent = NULL;
 
 void log_msg(const char* tag, const char* fmt, ...) {
     va_list args;
@@ -90,7 +93,59 @@ void log_msg(const char* tag, const char* fmt, ...) {
 }
 
 // =============================================================================
-// Universal Local-HBM Controller (DRM IOCTL + Multi-Sysfs Fallback Engine)
+// Session Watchdog & Logcat Thread
+// =============================================================================
+void set_session_state(bool active) {
+    pthread_mutex_lock(&g_session_lock);
+    if (g_session_active != active) {
+        g_session_active = active;
+        log_msg("SESSION", "Biometric Authentication Session state changed: %s", active ? "ACTIVE" : "INACTIVE");
+    }
+    pthread_mutex_unlock(&g_session_lock);
+}
+
+bool is_session_active() {
+    pthread_mutex_lock(&g_session_lock);
+    bool active = g_session_active;
+    pthread_mutex_unlock(&g_session_lock);
+    return active;
+}
+
+void* logcat_session_listener(void* arg) {
+    log_msg("SESSION", "Starting Logcat Session Listener Thread...");
+    
+    // Clear buffer first, then stream fingerprint log messages
+    FILE* pipe = popen("logcat -c && logcat -v tag -s FingerprintService BiometricService AuthContainer 2>/dev/null", "r");
+    if (!pipe) {
+        log_msg("ERROR", "Failed to start logcat session listener pipe!");
+        return NULL;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), pipe) != NULL) {
+        // Detect arming / starting session events
+        if (strstr(line, "prepareForAuthentication") || 
+            strstr(line, "onAcquired") || 
+            strstr(line, "authenticate()") ||
+            strstr(line, "enroll()")) {
+            set_session_state(true);
+        }
+        // Detect disarming / stopping session events
+        else if (strstr(line, "onAuthenticated") || 
+                 strstr(line, "cancelAuthentication") || 
+                 strstr(line, "onError") ||
+                 strstr(line, "USER_CANCELED") ||
+                 strstr(line, "HIDE_AUTH_DATA")) {
+            set_session_state(false);
+        }
+    }
+
+    pclose(pipe);
+    return NULL;
+}
+
+// =============================================================================
+// Display Local-HBM Driver Engine
 // =============================================================================
 void set_local_hbm(bool enable) {
     bool success = false;
@@ -99,13 +154,13 @@ void set_local_hbm(bool enable) {
     if (g_drm_fd >= 0) {
         struct disp_param_req req;
         
-        req.param_id = 0; req.value = enable ? PARAM_P0 : 0;
+        req.param_id = 0; req.value = enable ? CONFIG_LHBM_PARAM_P0 : 0;
         ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
 
-        req.param_id = 1; req.value = enable ? PARAM_P1 : 0;
+        req.param_id = 1; req.value = enable ? CONFIG_LHBM_PARAM_P1 : 0;
         ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
 
-        req.param_id = 2; req.value = enable ? PARAM_P2 : 0;
+        req.param_id = 2; req.value = enable ? CONFIG_LHBM_PARAM_P2 : 0;
         if (ioctl(g_drm_fd, DRM_IOCTL_MDSS_DISP_PARAM, &req) == 0) {
             log_msg("LHBM", "DRM IOCTL toggled -> %s", enable ? "ON" : "OFF");
             success = true;
@@ -128,12 +183,12 @@ void set_local_hbm(bool enable) {
     }
 
     // Engine 3: Touch Gesture Enable Sysfs Toggle
-    int fod_fd = open(SYSFS_FOD_EN, O_WRONLY);
+    int fod_fd = open(CONFIG_SYSFS_FOD_EN, O_WRONLY);
     if (fod_fd >= 0) {
         const char* val = enable ? "1" : "0";
         write(fod_fd, val, strlen(val));
         close(fod_fd);
-        log_msg("GESTURE", "FOD Sysfs Node [%s] toggled -> %s", SYSFS_FOD_EN, val);
+        log_msg("GESTURE", "FOD Sysfs Node [%s] toggled -> %s", CONFIG_SYSFS_FOD_EN, val);
     }
 
     if (!success) {
@@ -142,30 +197,41 @@ void set_local_hbm(bool enable) {
 }
 
 // =============================================================================
-// Dynamic HAL Resolver
+// Fingerprint HAL HIDL Resolver
 // =============================================================================
 void init_hal_library() {
     for (int i = 0; TARGET_LIBS[i] != NULL; i++) {
         g_hal_handle = dlopen(TARGET_LIBS[i], RTLD_NOW);
         if (g_hal_handle) {
-            log_msg("HAL", "Successfully loaded HAL library: %s", TARGET_LIBS[i]);
-            g_sendFodEvent = (sendFodEvent_t)dlsym(g_hal_handle, "sendFodEvent");
-            if (g_sendFodEvent) {
-                log_msg("HAL", "Symbol 'sendFodEvent' resolved!");
-            } else {
-                log_msg("WARN", "Loaded %s but 'sendFodEvent' symbol not found.", TARGET_LIBS[i]);
+            log_msg("HAL", "Loaded HAL shared library: %s", TARGET_LIBS[i]);
+            
+            // Iterate over known C++ mangled symbols for Motorola HIDL
+            for (int j = 0; MOTO_HIDL_SYMBOLS[j] != NULL; j++) {
+                g_sendFodEvent = (moto_sendFodEvent_t)dlsym(g_hal_handle, MOTO_HIDL_SYMBOLS[j]);
+                if (g_sendFodEvent) {
+                    log_msg("HAL", "Resolved sendFodEvent symbol: %s", MOTO_HIDL_SYMBOLS[j]);
+                    return;
+                }
             }
-            return;
+            log_msg("WARN", "Loaded %s but failed to resolve HIDL sendFodEvent symbol.", TARGET_LIBS[i]);
         }
     }
-    log_msg("ERROR", "Could not load any compatible vendor fingerprint shared library!");
+    log_msg("ERROR", "Could not resolve any compatible vendor fingerprint HAL symbol!");
+}
+
+void trigger_fod_event(int state) {
+    if (g_sendFodEvent) {
+        // Pass dummy HIDL 'this' pointer as first parameter for C++ ABI method calls
+        g_sendFodEvent(g_hal_handle, state);
+        log_msg("HAL", "Dispatched HIDL sendFodEvent(%d)", state);
+    }
 }
 
 // =============================================================================
-// Main Execution Daemon
+// Main Daemon Execution Core
 // =============================================================================
 int main(int argc, char** argv) {
-    // Parse Arguments for Debug / Logging
+    // Parse Arguments for Debug / Logging Modes
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
             g_debug_mode = true;
@@ -179,36 +245,47 @@ int main(int argc, char** argv) {
 
     log_msg("INIT", "Starting Motorola UDFPS Native Bridge Daemon...");
 
-    // Initialize DRM Display Engine
-    g_drm_fd = open(DRM_CARD_NODE, O_RDWR);
+    // Start Logcat Session Listener Thread
+    pthread_t logcat_thread;
+    pthread_create(&logcat_thread, NULL, logcat_session_listener, NULL);
+
+    // Initialize DRM Display Device
+    g_drm_fd = open(CONFIG_DRM_CARD_NODE, O_RDWR);
     if (g_drm_fd >= 0) {
-        log_msg("INIT", "Opened DRM Card: %s", DRM_CARD_NODE);
+        log_msg("INIT", "Opened DRM Card Device: %s", CONFIG_DRM_CARD_NODE);
     } else {
-        log_msg("WARN", "Failed to open DRM card %s. Will rely on Sysfs fallbacks.", DRM_CARD_NODE);
+        log_msg("WARN", "DRM Card %s unreadable. Falling back to Sysfs display engines.", CONFIG_DRM_CARD_NODE);
     }
 
-    // Resolve Fingerprint HAL
+    // Resolve Fingerprint HAL HIDL Symbol
     init_hal_library();
 
-    // Open Kernel Touch Event Node
-    int input_fd = open(INPUT_EVENT_NODE, O_RDONLY);
+    // Open Input Device Event
+    int input_fd = open(CONFIG_INPUT_NODE, O_RDONLY);
     if (input_fd < 0) {
-        log_msg("ERROR", "Cannot open input node %s! Exiting.", INPUT_EVENT_NODE);
+        log_msg("ERROR", "Failed to open kernel input node %s! Exiting.", CONFIG_INPUT_NODE);
         return 1;
     }
-    log_msg("INIT", "Listening for touch events on %s (Target Keycode: %d)", INPUT_EVENT_NODE, TARGET_KEYCODE);
+    log_msg("INIT", "Monitoring input node %s for Keycode %d", CONFIG_INPUT_NODE, CONFIG_TARGET_KEYCODE);
 
     struct input_event ev;
     while (read(input_fd, &ev, sizeof(ev)) > 0) {
-        if (ev.type == EV_KEY && (ev.code == TARGET_KEYCODE || ev.code == 0x2c0 || ev.code == 0x140)) {
+        if (ev.type == EV_KEY && (ev.code == CONFIG_TARGET_KEYCODE || ev.code == 0x2c0)) {
+            
+            // SESSION GATE: Only process touch events if a biometric session is active!
+            if (!is_session_active()) {
+                log_msg("TOUCH", "Touch detected on FOD keycode, but ignored (No active biometric session).");
+                continue;
+            }
+
             if (ev.value == 1) { // Touch down event
-                log_msg("TOUCH", "Finger Down Detected!");
+                log_msg("TOUCH", "Finger Down Detected (Session Active)!");
                 set_local_hbm(true);
-                if (g_sendFodEvent) g_sendFodEvent(0);
+                trigger_fod_event(0);
             } else if (ev.value == 0) { // Touch release event
                 log_msg("TOUCH", "Finger Lift Detected!");
                 set_local_hbm(false);
-                if (g_sendFodEvent) g_sendFodEvent(1);
+                trigger_fod_event(1);
             }
         }
     }

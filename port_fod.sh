@@ -21,9 +21,9 @@ echo -e "${BLUE}======================================================${NC}"
 echo ""
 
 # ------------------------------------------------------------------------------
-# 0. Check & Install Dependencies
+# 0. Check Toolchain Dependencies
 # ------------------------------------------------------------------------------
-echo -e "${BLUE}[Step 0/6] Checking required toolchain dependencies...${NC}"
+echo -e "${BLUE}[Step 0/5] Checking toolchain dependencies...${NC}"
 MISSING_PKGS=()
 command -v clang++ >/dev/null 2>&1 || MISSING_PKGS+=("clang")
 command -v git >/dev/null 2>&1 || MISSING_PKGS+=("git")
@@ -33,79 +33,67 @@ if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo -e "${YELLOW}[!] Installing missing dependencies: ${MISSING_PKGS[*]}...${NC}"
     pkg update -y && pkg install "${MISSING_PKGS[@]}" -y
 else
-    echo -e "${GREEN}[✓] All dependencies (clang++, git, zip) are installed.${NC}"
+    echo -e "${GREEN}[✓] Toolchain dependencies available.${NC}"
 fi
 
 # ------------------------------------------------------------------------------
-# 1. Detect Input Event Node & Keycode Automatically
+# 1. Precise Input Node Detection
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 1/6] Detecting Fingerprint Input Event Node & Keycode...${NC}"
-echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor area on your screen now...${NC}"
-echo -e "${YELLOW}   (Waiting 7 seconds for touch events)${NC}"
+echo -e "${BLUE}[Step 1/5] Identifying Fingerprint Input Node...${NC}"
 
-GE_LOG="/tmp/getevent_test.log"
-getevent -l > "$GE_LOG" &
-GE_PID=$!
-sleep 7
-kill $GE_PID 2>/dev/null || true
-
-DETECTED_EVENT=$(grep -E "BTN_TOUCH|BTN_TRIGGER_HAPPY|02c0|0140|704" "$GE_LOG" | head -n 1 | awk '{print $1}' | tr -d ':')
+# Scan device capabilities for fingerprint/goodix input devices
+DETECTED_EVENT=$(getevent -lp 2>/dev/null | grep -B 5 -i -E "fingerprint|goodix|fod" | grep -o "/dev/input/event[0-9]*" | head -n 1)
 
 if [ -z "$DETECTED_EVENT" ]; then
-    echo -e "${YELLOW}[!] Auto-detection timed out. Defaulting to /dev/input/event10${NC}"
-    DETECTED_EVENT="/dev/input/event10"
-else
-    echo -e "${GREEN}[✓] Detected Input Node: $DETECTED_EVENT${NC}"
+    echo -e "${YELLOW}[!] Device capability scan inconclusive. Waiting for touch test...${NC}"
+    echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor area on screen now (7 sec)...${NC}"
+    
+    GE_LOG="/tmp/getevent_test.log"
+    getevent -l > "$GE_LOG" &
+    GE_PID=$!
+    sleep 7
+    kill $GE_PID 2>/dev/null || true
+
+    DETECTED_EVENT=$(grep -E "BTN_TRIGGER_HAPPY|02c0" "$GE_LOG" | head -n 1 | awk '{print $1}' | tr -d ':')
 fi
 
-if grep -q -E "02c0|BTN_TRIGGER_HAPPY" "$GE_LOG"; then
-    CHOSEN_KEY="704"
-    echo -e "${GREEN}[✓] Automatically detected Keycode: 704 (BTN_TRIGGER_HAPPY)${NC}"
-elif grep -q -E "0140|BTN_TOUCH" "$GE_LOG"; then
-    CHOSEN_KEY="330"
-    echo -e "${GREEN}[✓] Automatically detected Keycode: 330 (BTN_TOUCH)${NC}"
+if [ -z "$DETECTED_EVENT" ]; then
+    DETECTED_EVENT="/dev/input/event10"
+    echo -e "${YELLOW}[!] Defaulting input event path to: $DETECTED_EVENT${NC}"
 else
-    CHOSEN_KEY="704"
-    echo -e "${YELLOW}[!] Keycode not matched in log. Defaulting to 704 (BTN_TRIGGER_HAPPY)${NC}"
+    echo -e "${GREEN}[✓] Detected Fingerprint Input Node: $DETECTED_EVENT${NC}"
 fi
+
+CHOSEN_KEY="704"
 
 # ------------------------------------------------------------------------------
-# 2. Detect FOD Sysfs Gesture Node
+# 2. FOD Sysfs Node Discovery
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 2/6] Detecting FOD Sysfs Gesture Node...${NC}"
+echo -e "${BLUE}[Step 2/5] Locating FOD Gesture Sysfs Node...${NC}"
 DETECTED_SYSFS=$(find /sys -iname "*fod_en*" 2>/dev/null | head -n 1)
 
 if [ -z "$DETECTED_SYSFS" ]; then
     DETECTED_SYSFS="/sys/devices/platform/goodix_ts.0/gesture/fod_en"
-    echo -e "${YELLOW}[!] Could not locate active sysfs node. Defaulting to $DETECTED_SYSFS${NC}"
+    echo -e "${YELLOW}[!] Defaulting Sysfs Node path to: $DETECTED_SYSFS${NC}"
 else
-    echo -e "${GREEN}[✓] Found FOD Sysfs Node: $DETECTED_SYSFS${NC}"
+    echo -e "${GREEN}[✓] Discovered Sysfs FOD Node: $DETECTED_SYSFS${NC}"
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Detect Display Hardware Interface
+# 3. Display Interface Identification & Calibration Branch
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 3/6] Detecting Display Hardware Interface...${NC}"
+echo -e "${BLUE}[Step 3/5] Calibrating Display Local-HBM (LHBM) Engine...${NC}"
 
 DRM_NODE="/dev/dri/card0"
-if [ -c "$DRM_NODE" ]; then
-    echo -e "${GREEN}[✓] Qualcomm DRM Node Found: $DRM_NODE${NC}"
-else
-    echo -e "${YELLOW}[!] DRM Node not found. Checking MediaTek / Sysfs HBM nodes...${NC}"
-    SYSFS_HBM=$(find /sys -iname "*hbm*" 2>/dev/null | head -n 1)
-    if [ -n "$SYSFS_HBM" ]; then
-        echo -e "${GREEN}[✓] Found Sysfs HBM Fallback Node: $SYSFS_HBM${NC}"
-    fi
-fi
+PARAM_P0="2"
+PARAM_P1="2"
+PARAM_P2="0"
 
-# ------------------------------------------------------------------------------
-# 4. Calibrate Local-HBM Parameters Interactively
-# ------------------------------------------------------------------------------
-echo ""
-echo -e "${BLUE}[Step 4/6] Calibrating DRM Local-HBM (LHBM) Display Parameters...${NC}"
+if [ -c "$DRM_NODE" ]; then
+    echo -e "${GREEN}[✓] DRM Interface Found ($DRM_NODE). Testing DRM IOCTL Presets...${NC}"
 
 cat << 'EOF' > /tmp/test_lhbm.c
 #include <stdio.h>
@@ -142,58 +130,57 @@ int main(int argc, char **argv) {
 }
 EOF
 
-clang /tmp/test_lhbm.c -o /tmp/test_lhbm
+    clang /tmp/test_lhbm.c -o /tmp/test_lhbm
+    PRESETS=("2 2 0" "1 1 0" "2 1 0")
 
-PRESETS=(
-    "2 2 0"
-    "1 1 0"
-    "2 1 0"
-    "1 2 0"
-)
-
-PARAM_P0="2"
-PARAM_P1="2"
-PARAM_P2="0"
-
-for preset in "${PRESETS[@]}"; do
-    echo ""
-    echo -e "${YELLOW}Testing DRM Parameters: $preset ...${NC}"
-    /tmp/test_lhbm $preset
-    read -p "Did the fingerprint area / screen illuminate with Local-HBM high brightness? (y/N): " RESP
-    if [[ "$RESP" =~ ^[Yy]$ ]]; then
-        PARAM_P0=$(echo $preset | awk '{print $1}')
-        PARAM_P1=$(echo $preset | awk '{print $2}')
-        PARAM_P2=$(echo $preset | awk '{print $3}')
-        echo -e "${GREEN}[✓] Confirmed LHBM Parameters: P0=$PARAM_P0, P1=$PARAM_P1, P2=$PARAM_P2${NC}"
-        break
-    else
-        /tmp/test_lhbm 0 0 0 2>/dev/null || true
-    fi
-done
-
-# Turn off test illumination
-/tmp/test_lhbm 0 0 0 2>/dev/null || true
+    for preset in "${PRESETS[@]}"; do
+        echo -e "${YELLOW}Testing DRM Preset: $preset ...${NC}"
+        /tmp/test_lhbm $preset
+        read -p "Did the screen fingerprint circle illuminate high-brightness? (y/N): " RESP
+        if [[ "$RESP" =~ ^[Yy]$ ]]; then
+            PARAM_P0=$(echo $preset | awk '{print $1}')
+            PARAM_P1=$(echo $preset | awk '{print $2}')
+            PARAM_P2=$(echo $preset | awk '{print $3}')
+            echo -e "${GREEN}[✓] Confirmed DRM Parameters: P0=$PARAM_P0, P1=$PARAM_P1, P2=$PARAM_P2${NC}"
+            break
+        fi
+    done
+    /tmp/test_lhbm 0 0 0 2>/dev/null || true
+else
+    echo -e "${YELLOW}[!] DRM Node not found. Utilizing Sysfs Fallback Engines.${NC}"
+fi
 
 # ------------------------------------------------------------------------------
-# 5. Patch Source Code
+# 4. Generate Clean Device Configuration Header
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 5/6] Patching src/moto_fod_bridge.cpp with discovered values...${NC}"
+echo -e "${BLUE}[Step 4/5] Generating Header: include/device_config.h ...${NC}"
+mkdir -p include
 
-sed -i "s|static const char\* INPUT_EVENT_NODE = .*;|static const char\* INPUT_EVENT_NODE = \"$DETECTED_EVENT\";|" src/moto_fod_bridge.cpp
-sed -i "s|static int TARGET_KEYCODE = .*;|static int TARGET_KEYCODE = $CHOSEN_KEY;|" src/moto_fod_bridge.cpp
-sed -i "s|static const char\* SYSFS_FOD_EN = .*;|static const char\* SYSFS_FOD_EN = \"$DETECTED_SYSFS\";|" src/moto_fod_bridge.cpp
-sed -i "s|static int PARAM_P0 = .*;|static int PARAM_P0 = $PARAM_P0;|" src/moto_fod_bridge.cpp
-sed -i "s|static int PARAM_P1 = .*;|static int PARAM_P1 = $PARAM_P1;|" src/moto_fod_bridge.cpp
-sed -i "s|static int PARAM_P2 = .*;|static int PARAM_P2 = $PARAM_P2;|" src/moto_fod_bridge.cpp
+cat << EOF > include/device_config.h
+#ifndef DEVICE_CONFIG_H
+#define DEVICE_CONFIG_H
 
-echo -e "${GREEN}[✓] src/moto_fod_bridge.cpp successfully updated!${NC}"
+#define CONFIG_INPUT_NODE "$DETECTED_EVENT"
+#define CONFIG_TARGET_KEYCODE $CHOSEN_KEY
+
+#define CONFIG_SYSFS_FOD_EN "$DETECTED_SYSFS"
+#define CONFIG_DRM_CARD_NODE "$DRM_NODE"
+
+#define CONFIG_LHBM_PARAM_P0 $PARAM_P0
+#define CONFIG_LHBM_PARAM_P1 $PARAM_P1
+#define CONFIG_LHBM_PARAM_P2 $PARAM_P2
+
+#endif // DEVICE_CONFIG_H
+EOF
+
+echo -e "${GREEN}[✓] Header generated without mutating repository source code!${NC}"
 
 # ------------------------------------------------------------------------------
-# 6. Compile & Package Module
+# 5. Build Binary & Package Module
 # ------------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}[Step 6/6] Compiling Binary and Building Magisk Module...${NC}"
+echo -e "${BLUE}[Step 5/5] Compiling and Packaging Magisk Module...${NC}"
 
 mkdir -p magisk_module/vendor/bin
 mkdir -p out
@@ -204,9 +191,9 @@ clang++ -std=c++17 -O3 \
     -lpthread -ldl
 
 if [ -f "magisk_module/vendor/bin/moto_fod_bridge" ]; then
-    echo -e "${GREEN}[✓] Compilation successful!${NC}"
+    echo -e "${GREEN}[✓] Binary compilation succeeded!${NC}"
 else
-    echo -e "${RED}[X] Compilation failed. Check compiler errors.${NC}"
+    echo -e "${RED}[X] Compilation failed.${NC}"
     exit 1
 fi
 
@@ -217,12 +204,5 @@ fi
 
 echo ""
 echo -e "${GREEN}======================================================${NC}"
-echo -e "${GREEN}🎉 PORTING COMPLETE!${NC}"
+echo -e "${GREEN}🎉 PORTING & BUILD COMPLETE!${NC}"
 echo -e "${GREEN}======================================================${NC}"
-echo -e "Your customized Magisk/KSU module has been built."
-echo -e "Flash the ZIP in Magisk / KernelSU / APatch and reboot."
-echo ""
-echo -e "${YELLOW}💡 Live Debugging Commands:${NC}"
-echo -e "If you flash the module and need to debug:"
-echo -e "  ${BLUE}su -c '/vendor/bin/moto_fod_bridge --debug'${NC} (Live Terminal Diagnostics)"
-echo -e "  ${BLUE}su -c '/vendor/bin/moto_fod_bridge --log'${NC}   (Saves to /sdcard/fod_bridge_debug.log)"

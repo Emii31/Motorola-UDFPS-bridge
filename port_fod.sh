@@ -26,7 +26,6 @@ echo -e "${BLUE}======================================================${NC}"
 echo -e "${BLUE} Motorola Universal GSI FOD Hardware Scanner & Porter ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 
-# Profile handling: explicit parameter OR exact Boston hardware match
 DEVICE_CODENAME=$(getprop ro.product.device)
 if [ "$1" == "--profile" ] && [ -n "$2" ]; then
     PROF_FILE="profiles/$2.conf"
@@ -58,30 +57,21 @@ fi
 
 if [ -n "$INPUT_NODE" ] && [ -z "$TARGET_KEYCODE" ]; then
     echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor on screen now (5 sec test)...${NC}"
-    EV_LOG="/tmp/ev_test.log"
-    getevent -ql "$INPUT_NODE" > "$EV_LOG" &
-    GE_PID=$!
-    sleep 5
-    kill $GE_PID 2>/dev/null || true
-
-    RAW_CODE=$(grep "EV_KEY" "$EV_LOG" | head -n 1 | awk '{print $3}')
-    if [ -n "$RAW_CODE" ]; then
-        if [[ "$RAW_CODE" == KEY_* ]]; then
-            TARGET_KEYCODE=704
-        else
-            TARGET_KEYCODE=$((16#$RAW_CODE))
-        fi
-        echo -e "${GREEN}[✓] Discovered Numeric Keycode: $TARGET_KEYCODE ($RAW_CODE)${NC}"
+    
+    # Capture raw numeric event code directly from getevent
+    HEX_CODE=$(getevent -c 5 "$INPUT_NODE" 2>/dev/null | grep " 0001 " | head -n 1 | awk '{print $3}')
+    
+    if [ -n "$HEX_CODE" ]; then
+        TARGET_KEYCODE=$((16#$HEX_CODE))
+        echo -e "${GREEN}[✓] Discovered Numeric Keycode: $TARGET_KEYCODE (Raw Hex: 0x$HEX_CODE)${NC}"
     fi
 fi
 
-# Hard Stop: Stop if input discovery fails
 if [ -z "$INPUT_NODE" ] || [ -z "$TARGET_KEYCODE" ]; then
     echo -e "\n${RED}[X] Unknown Device / Input Discovery Failed!${NC}"
-    echo -e "${RED}[X] Could not auto-detect fingerprint input node or keycode.${NC}"
+    echo -e "${RED}[X] Could not auto-detect fingerprint input node or target keycode.${NC}"
     echo -e "${YELLOW}👉 Supply a valid profile: 'bash port_fod.sh --profile <profile_name>'${NC}"
     log_report "Status: DISCOVERY FAILED (Input Node / Keycode Unverified)"
-    echo -e "${GREEN}[✓] Diagnostic report written to: $REPORT_FILE${NC}"
     exit 1
 fi
 
@@ -95,25 +85,28 @@ fi
 
 if [ -z "$SYSFS_FOD_EN" ]; then
     echo -e "${YELLOW}[!] Warning: No Sysfs FOD control node discovered.${NC}"
-    log_report "Sysfs Node: NONE (DRM Engine will be primary)"
+    SYSFS_FOD_EN="/dev/null"
+    log_report "Sysfs Node: NONE (DRM Engine primary)"
 else
     echo -e "${GREEN}[✓] Discovered Sysfs Node: $SYSFS_FOD_EN${NC}"
     log_report "Sysfs Node: $SYSFS_FOD_EN"
 fi
 
-# 3. Display Driver Engine Setup (Explicitly marked as default or profile-supplied)
+# 3. Display Driver Engine
 DRM_CARD_NODE=${DRM_CARD_NODE:-"/dev/dri/card0"}
 P0=${LHBM_PARAM_P0:-2}
 P1=${LHBM_PARAM_P1:-2}
 P2=${LHBM_PARAM_P2:-0}
 log_report "Display Engine: DRM $DRM_CARD_NODE [P0=$P0, P1=$P1, P2=$P2]"
 
-# 4. Fingerprint Backend Selection
+# 4. Fingerprint Backend Selection (Strict Fail-Closed)
 FINGERPRINT_LIB=${FINGERPRINT_LIB:-"/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"}
 if [ -f "$FINGERPRINT_LIB" ]; then
     FP_BACKEND="motorola_hidl"
 else
-    FP_BACKEND="aosp_hidl"
+    echo -e "\n${RED}[X] Error: Required Motorola fingerprint library ($FINGERPRINT_LIB) not found!${NC}"
+    log_report "Status: FAILED (Missing Motorola HIDL Library)"
+    exit 1
 fi
 log_report "Fingerprint Backend: $FP_BACKEND"
 
@@ -128,7 +121,7 @@ cat << EOF > include/device_config.h
 #define CONFIG_INPUT_NODE "$INPUT_NODE"
 #define CONFIG_TARGET_KEYCODE $TARGET_KEYCODE
 
-#define CONFIG_SYSFS_FOD_EN "${SYSFS_FOD_EN:-/dev/null}"
+#define CONFIG_SYSFS_FOD_EN "$SYSFS_FOD_EN"
 #define CONFIG_DRM_CARD_NODE "$DRM_CARD_NODE"
 
 #define CONFIG_LHBM_PARAM_P0 $P0

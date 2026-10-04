@@ -12,172 +12,99 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Profile argument support
+if [ "$1" == "--profile" ] && [ -n "$2" ]; then
+    PROF_FILE="profiles/$2.conf"
+    if [ -f "$PROF_FILE" ]; then
+        echo -e "${GREEN}[✓] Loading requested profile: $PROF_FILE${NC}"
+        source "$PROF_FILE"
+    else
+        echo -e "${RED}[X] Profile $PROF_FILE not found! Exiting.${NC}"
+        exit 1
+    fi
+fi
+
 REPORT_FILE="fod_port_report.txt"
 rm -f "$REPORT_FILE"
 
-log_report() {
-    echo "$1" >> "$REPORT_FILE"
-}
+log_report() { echo "$1" >> "$REPORT_FILE"; }
 
-log_report "=== Motorola GSI FOD Port Report ==="
+log_report "=== Motorola Universal GSI FOD Report ==="
 log_report "Date: $(date)"
-log_report "Manufacturer: $(getprop ro.product.manufacturer)"
-log_report "Model: $(getprop ro.product.model)"
-log_report "Device Codename: $(getprop ro.product.device)"
-log_report "Android Version: $(getprop ro.build.version.release)"
-log_report "------------------------------------"
+log_report "Device: $(getprop ro.product.manufacturer) $(getprop ro.product.model) ($(getprop ro.product.device))"
+log_report "----------------------------------------"
 
 echo -e "${BLUE}======================================================${NC}"
-echo -e "${BLUE} Motorola GSI FOD Framework Hardware Scanner & Porter ${NC}"
+echo -e "${BLUE} Motorola Universal GSI FOD Hardware Scanner & Porter ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 
-# ------------------------------------------------------------------------------
-# 1. Broad EV_KEY Input Scanner
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}[Step 1/5] Scanning Input Devices...${NC}"
-DETECTED_EVENT=""
-CONFIRMED_KEYCODE=""
+# 1. Device-Agnostic Input Discovery
+if [ -z "$INPUT_NODE" ]; then
+    echo -e "\n${BLUE}[Step 1/5] Scanning Input Devices...${NC}"
+    for ev in /dev/input/event*; do
+        NAME=$(getevent -p "$ev" 2>/dev/null | grep "name:" | cut -d'"' -f2)
+        if echo "$NAME" | grep -i -E "fingerprint|goodix|fod" >/dev/null; then
+            INPUT_NODE="$ev"
+            echo -e "${GREEN}[✓] Discovered Sensor Node: $ev ($NAME)${NC}"
+            break
+        fi
+    done
+fi
 
-for ev in /dev/input/event*; do
-    NAME=$(getevent -p "$ev" 2>/dev/null | grep "name:" | cut -d'"' -f2)
-    if echo "$NAME" | grep -i -E "fingerprint|goodix|fod" >/dev/null; then
-        DETECTED_EVENT="$ev"
-        echo -e "${GREEN}[✓] Discovered Candidate Node: $ev ($NAME)${NC}"
-        log_report "Input Node: $ev ($NAME)"
-        break
-    fi
-done
-
-if [ -n "$DETECTED_EVENT" ]; then
+if [ -n "$INPUT_NODE" ] && [ -z "$TARGET_KEYCODE" ]; then
     echo -e "${YELLOW}👉 Touch and hold the fingerprint sensor on screen now (5 sec test)...${NC}"
     EV_LOG="/tmp/ev_test.log"
-    getevent -l "$DETECTED_EVENT" > "$EV_LOG" &
+    getevent -ql "$INPUT_NODE" > "$EV_LOG" &
     GE_PID=$!
     sleep 5
     kill $GE_PID 2>/dev/null || true
 
-    # Extract any generated EV_KEY event code during touch test
-    CAPTURED_KEY=$(grep "EV_KEY" "$EV_LOG" | head -n 1 | awk '{print $3}')
-    if [ -n "$CAPTURED_KEY" ]; then
-        if [ "$CAPTURED_KEY" == "KEY_02c0" ] || [ "$CAPTURED_KEY" == "02c0" ] || [ "$CAPTURED_KEY" == "BTN_TRIGGER_HAPPY5" ]; then
-            CONFIRMED_KEYCODE="704"
-        elif [ "$CAPTURED_KEY" == "BTN_TOUCH" ] || [ "$CAPTURED_KEY" == "0140" ]; then
-            CONFIRMED_KEYCODE="330"
+    # Parse numerical event code from raw event dump
+    RAW_CODE=$(grep "EV_KEY" "$EV_LOG" | head -n 1 | awk '{print $3}')
+    if [ -n "$RAW_CODE" ]; then
+        # Convert hex keycode representation if necessary
+        if [[ "$RAW_CODE" == KEY_* ]]; then
+            TARGET_KEYCODE=704
         else
-            CONFIRMED_KEYCODE="704" # Default for Motorola
+            TARGET_KEYCODE=$((16#$RAW_CODE))
         fi
-        echo -e "${GREEN}[✓] Detected Active Keycode: $CONFIRMED_KEYCODE ($CAPTURED_KEY)${NC}"
-        log_report "Keycode Detected: $CONFIRMED_KEYCODE ($CAPTURED_KEY)"
+        echo -e "${GREEN}[✓] Discovered Numeric Keycode: $TARGET_KEYCODE ($RAW_CODE)${NC}"
     fi
 fi
 
-if [ -z "$DETECTED_EVENT" ] || [ -z "$CONFIRMED_KEYCODE" ]; then
-    echo -e "${YELLOW}[!] Discovery incomplete. Loading reference profile 'boston'...${NC}"
-    if [ -f "profiles/boston.conf" ]; then source profiles/boston.conf; fi
-    DETECTED_EVENT=${INPUT_NODE:-"/dev/input/event10"}
-    CONFIRMED_KEYCODE=${TARGET_KEYCODE:-"704"}
-    log_report "Input Node Fallback: $DETECTED_EVENT (Keycode: $CONFIRMED_KEYCODE)"
+# Halt if hardware scanner fails rather than silently loading defaults
+if [ -z "$INPUT_NODE" ] || [ -z "$TARGET_KEYCODE" ]; then
+    echo -e "\n${RED}[X] Automatic input discovery failed!${NC}"
+    echo -e "${YELLOW}Run with '--profile boston' if using the Motorola Moto G Stylus 5G reference device.${NC}"
+    log_report "Status: INPUT DISCOVERY FAILED"
+    exit 1
 fi
 
-# ------------------------------------------------------------------------------
-# 2. FOD Sysfs Node Discovery & Verification
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}[Step 2/5] Locating FOD Sysfs Control Node...${NC}"
-DETECTED_SYSFS=$(find /sys -iname "*fod_en*" 2>/dev/null | head -n 1)
+log_report "Input Device: $INPUT_NODE (Keycode: $TARGET_KEYCODE)"
 
-if [ -n "$DETECTED_SYSFS" ] && [ -w "$DETECTED_SYSFS" ]; then
-    echo -e "${GREEN}[✓] Verified Writable Sysfs Node: $DETECTED_SYSFS${NC}"
-    log_report "Sysfs FOD Node: $DETECTED_SYSFS (Verified)"
-else
-    DETECTED_SYSFS="/sys/devices/platform/goodix_ts.0/gesture/fod_en"
-    echo -e "${YELLOW}[!] Defaulting Sysfs Node: $DETECTED_SYSFS${NC}"
-    log_report "Sysfs FOD Node: $DETECTED_SYSFS (Fallback)"
+# 2. Sysfs FOD Control Discovery
+if [ -z "$SYSFS_FOD_EN" ]; then
+    echo -e "\n${BLUE}[Step 2/5] Locating Sysfs Control Node...${NC}"
+    SYSFS_FOD_EN=$(find /sys -iname "*fod_en*" 2>/dev/null | head -n 1)
 fi
+SYSFS_FOD_EN=${SYSFS_FOD_EN:-"/sys/devices/platform/goodix_ts.0/gesture/fod_en"}
+log_report "Sysfs Node: $SYSFS_FOD_EN"
 
-# ------------------------------------------------------------------------------
-# 3. DRM Display Engine & Parameter Calibration
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}[Step 3/5] Calibrating Display Local-HBM (LHBM) Engine...${NC}"
-DRM_NODE="/dev/dri/card0"
-P0=2; P1=2; P2=0
+# 3. DRM Parameter Calibration
+DRM_CARD_NODE=${DRM_CARD_NODE:-"/dev/dri/card0"}
+P0=${LHBM_PARAM_P0:-2}; P1=${LHBM_PARAM_P1:-2}; P2=${LHBM_PARAM_P2:-0}
+log_report "Display Engine: DRM $DRM_CARD_NODE [P0=$P0, P1=$P1, P2=$P2]"
 
-if [ -c "$DRM_NODE" ]; then
-    echo -e "${GREEN}[✓] DRM Node Found ($DRM_NODE). Testing DRM IOCTL presets...${NC}"
-
-cat << 'EOF' > /tmp/test_lhbm.c
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-
-#define DRM_IOCTL_MDSS_DISP_PARAM 0xc008649f
-
-struct disp_param_req {
-    uint32_t param_id;
-    int32_t value;
-};
-
-int main(int argc, char **argv) {
-    if (argc != 4) return 1;
-    int fd = open("/dev/dri/card0", O_RDWR);
-    if (fd < 0) return 1;
-
-    struct disp_param_req req;
-    req.param_id = 0; req.value = atoi(argv[1]);
-    ioctl(fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-
-    req.param_id = 1; req.value = atoi(argv[2]);
-    ioctl(fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-
-    req.param_id = 2; req.value = atoi(argv[3]);
-    ioctl(fd, DRM_IOCTL_MDSS_DISP_PARAM, &req);
-
-    close(fd);
-    return 0;
-}
-EOF
-
-    clang /tmp/test_lhbm.c -o /tmp/test_lhbm
-    PRESETS=("2 2 0" "1 1 0" "2 1 0")
-
-    for preset in "${PRESETS[@]}"; do
-        echo -e "${YELLOW}Testing DRM Preset: $preset ...${NC}"
-        /tmp/test_lhbm $preset
-        read -p "Did the fingerprint icon illuminate in high brightness? (y/N): " RESP
-        if [[ "$RESP" =~ ^[Yy]$ ]]; then
-            P0=$(echo $preset | awk '{print $1}')
-            P1=$(echo $preset | awk '{print $2}')
-            P2=$(echo $preset | awk '{print $3}')
-            echo -e "${GREEN}[✓] Confirmed DRM Parameters: P0=$P0, P1=$P1, P2=$P2${NC}"
-            break
-        fi
-    done
-    /tmp/test_lhbm 0 0 0 2>/dev/null || true
-    log_report "Display Engine: Qualcomm DRM ($DRM_NODE) [P0=$P0, P1=$P1, P2=$P2]"
-else
-    echo -e "${YELLOW}[!] DRM Node not found. Operating in Sysfs mode.${NC}"
-    log_report "Display Engine: Sysfs Fallback Mode"
-fi
-
-# ------------------------------------------------------------------------------
-# 4. Fingerprint Vendor Shared Library Check
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}[Step 4/5] Checking Vendor Fingerprint Shared Libraries...${NC}"
-FINGERPRINT_LIB="/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"
-
+# 4. Fingerprint Backend Selection
+FINGERPRINT_LIB=${FINGERPRINT_LIB:-"/vendor/lib64/com.motorola.hardware.biometric.fingerprint@1.0.so"}
 if [ -f "$FINGERPRINT_LIB" ]; then
-    echo -e "${GREEN}[✓] Verified Motorola HIDL v1.0 Library: $FINGERPRINT_LIB${NC}"
-    log_report "Fingerprint HAL: Motorola HIDL v1.0 ($FINGERPRINT_LIB)"
+    FP_BACKEND="motorola_hidl"
 else
-    echo -e "${YELLOW}[!] Motorola HIDL v1.0 library missing. Bridge will handle LHBM toggling.${NC}"
-    log_report "Fingerprint HAL: Missing / Unverified"
+    FP_BACKEND="aosp_hidl"
 fi
+log_report "Fingerprint Backend: $FP_BACKEND"
 
-# ------------------------------------------------------------------------------
 # 5. Generate Header: include/device_config.h
-# ------------------------------------------------------------------------------
 echo -e "\n${BLUE}[Step 5/5] Generating Header: include/device_config.h ...${NC}"
 mkdir -p include
 
@@ -185,11 +112,11 @@ cat << EOF > include/device_config.h
 #ifndef DEVICE_CONFIG_H
 #define DEVICE_CONFIG_H
 
-#define CONFIG_INPUT_NODE "$DETECTED_EVENT"
-#define CONFIG_TARGET_KEYCODE $CONFIRMED_KEYCODE
+#define CONFIG_INPUT_NODE "$INPUT_NODE"
+#define CONFIG_TARGET_KEYCODE $TARGET_KEYCODE
 
-#define CONFIG_SYSFS_FOD_EN "$DETECTED_SYSFS"
-#define CONFIG_DRM_CARD_NODE "$DRM_NODE"
+#define CONFIG_SYSFS_FOD_EN "$SYSFS_FOD_EN"
+#define CONFIG_DRM_CARD_NODE "$DRM_CARD_NODE"
 
 #define CONFIG_LHBM_PARAM_P0 $P0
 #define CONFIG_LHBM_PARAM_P1 $P1
@@ -197,16 +124,15 @@ cat << EOF > include/device_config.h
 
 #define CONFIG_WATCHDOG_TIMEOUT_SEC 3
 
+#define CONFIG_FINGERPRINT_BACKEND "$FP_BACKEND"
 #define CONFIG_FINGERPRINT_LIB_PATH "$FINGERPRINT_LIB"
 
 #endif // DEVICE_CONFIG_H
 EOF
 
 echo -e "${GREEN}[✓] Header include/device_config.h successfully generated!${NC}"
-log_report "Status: CONFIGURATION GENERATED SUCCESSFULLY"
 
-# Trigger Build & Packaging Pipeline
 if [ -f "build.sh" ]; then bash build.sh; fi
 if [ -f "zip_module.sh" ]; then bash zip_module.sh; fi
 
-echo -e "\n${GREEN}[✓] Hardware diagnostic report written to: $REPORT_FILE${NC}"
+echo -e "\n${GREEN}[✓] Report written to: $REPORT_FILE${NC}"

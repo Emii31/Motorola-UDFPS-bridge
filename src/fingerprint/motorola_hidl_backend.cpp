@@ -13,25 +13,25 @@ struct HidlVecInt8 {
     uint8_t mPadding[3];
 };
 
-// Callback closure representation for Motorola HIDL sendFodEvent response
-typedef void (*FodCallbackFn)(void* userData, int32_t result, const HidlVecInt8* vec);
+// Typedef for Motorola HIDL sendFodEvent function pointer
+typedef void (*fn_send_fod_event_t)(void* instance, int32_t eventType, const HidlVecInt8* vec, const void* callbackFunc);
 
-// Mangled C++ symbols for Motorola Fingerprint HIDL v1.0 interface
+// Typedef for IMotoFingerPrint::getService
+typedef void* (*fn_get_service_t)(const void* serviceName, bool getStub);
+
+// Verified mangled C++ symbols from Boston vendor library
 static const char* MOTO_GET_SERVICE_SYM = 
-    "_ZN3com8motorola8hardware9biometric11fingerprint4V1_016IMotoFingerPrint10getServiceERKNSt3__112basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEEb";
+    "_ZN3com8motorola8hardware9biometric11fingerprint4V1_018IMotoFingerPrint10getServiceERKNSt3__112basic_stringIcNS5_11char_traitsIcEENS5_9allocatorIcEEEEb";
 
 static const char* MOTO_SEND_FOD_SYM = 
     "_ZN3com8motorola8hardware9biometric11fingerprint4V1_019BpHwMotoFingerPrint12sendFodEventENS4_16IMotFodEventTypeERKN7android8hardware8hidl_vecIaEENSt3__18functionIFvNS4_18IMotFodEventResultESC_EEE";
-
-typedef void* (*fn_getService)(const void* serviceName, bool getStub);
-typedef void (*fn_sendFodEvent)(void* instance, int32_t eventType, const HidlVecInt8* vec, const void* callbackFunc);
 
 class MotorolaHidlBackend : public IFingerprintBackend {
 private:
     const char* m_lib_path;
     void* m_handle;
     void* m_hidl_service;
-    fn_send_fod_event_t m_send_fod_fn; // function pointer for sendFodEvent
+    fn_send_fod_event_t m_send_fod_fn;
 
 public:
     MotorolaHidlBackend(const char* lib_path)
@@ -50,7 +50,7 @@ public:
             return false;
         }
 
-        fn_getService getService = (fn_getService)dlsym(m_handle, MOTO_GET_SERVICE_SYM);
+        fn_get_service_t getService = (fn_get_service_t)dlsym(m_handle, MOTO_GET_SERVICE_SYM);
         m_send_fod_fn = (fn_send_fod_event_t)dlsym(m_handle, MOTO_SEND_FOD_SYM);
 
         if (!getService || !m_send_fod_fn) {
@@ -77,11 +77,10 @@ public:
         emptyVec.mSize = 0;
         emptyVec.mOwnsBuffer = false;
 
-        // Dummy callback structure matching LLVM libUnwind / std::function layout (4 pointers)
+        // Dummy callback structure matching LLVM std::function layout
         void* dummyCallback[4] = { nullptr, nullptr, nullptr, nullptr };
 
-        // Execute HIDL invocation with verified ABI layout
-        ((fn_sendFodEvent)m_send_fod_fn)(m_hidl_service, state, &emptyVec, dummyCallback);
+        m_send_fod_fn(m_hidl_service, state, &emptyVec, dummyCallback);
     }
 
     const char* getName() const override { return "Motorola HIDL v1.0 Driver (Boston ABI)"; }
